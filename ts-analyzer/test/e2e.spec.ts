@@ -1,0 +1,99 @@
+/**
+ * End-to-end: run the full TsResolver + GraphBuilder on the .repo/sample-shop-react
+ * fixture, asserting the hard passes (cross-function wrapper tracing, env/baseURL,
+ * route→screen, stores), then join against the backend _combined.json.
+ */
+import * as fs from 'fs';
+import * as path from 'path';
+import { describe, expect, it } from 'vitest';
+import { GraphBuilder } from '../src/graphBuilder';
+import { join } from '../src/join';
+import * as jsonOutput from '../src/jsonOutput';
+import { CallGraph } from '../src/model';
+import { TsResolver } from '../src/resolver/irBuilder';
+
+const REPO = path.resolve(__dirname, '../../.repo');
+const BACKEND = path.resolve(__dirname, '../../../flowmap-spring-kotlin/kotlin-analyzer/json/_combined.json');
+
+function analyze(): CallGraph {
+  const files = new TsResolver().analyze({ repoRoot: REPO, projectFilter: 'sample-shop-react' });
+  return new GraphBuilder(files).build();
+}
+
+describe('e2e on sample-shop-react', () => {
+  const g = analyze();
+  const byId = (id: string) => g.nodes.find((n) => n.id === id);
+  const httpNodes = g.nodes.filter((n) => n.layer === 'API' || n.layer === 'EXTERNAL');
+
+  it('skips the Vue project and finds the React one', () => {
+    expect(g.nodes.length).toBeGreaterThan(0);
+    expect(g.nodes.every((n) => !n.file || n.file.startsWith('sample-shop-react') || n.id.startsWith('ext:') || n.id.startsWith('store:'))).toBe(true);
+  });
+
+  it('resolves a wrapper call + env baseURL + path param → full URL', () => {
+    const user = httpNodes.find((n) => n.endpoint === '/internal/users/{}');
+    expect(user).toBeTruthy();
+    expect(user!.httpMethod).toBe('GET');
+    expect(user!.externalUrl).toBe('https://api.shop.com/internal/users/{}');
+    expect(user!.confidence).toBe('resolved');
+  });
+
+  it('resolves all wrapper-based endpoints', () => {
+    const eps = httpNodes.map((n) => `${n.httpMethod} ${n.endpoint}`).sort();
+    expect(eps).toContain('POST /orders');
+    expect(eps).toContain('POST /orders/{}/notify');
+    expect(eps).toContain('GET /internal/investment/current-summary');
+  });
+
+  it('marks a bare fetch as partial (verb defaulted)', () => {
+    const f = httpNodes.find((n) => n.endpoint === '/orders' && n.layer === 'API');
+    expect(f).toBeTruthy();
+    expect(f!.confidence).toBe('partial');
+  });
+
+  it('classifies a third-party absolute URL as EXTERNAL', () => {
+    const maps = httpNodes.find((n) => n.externalUrl?.includes('maps.googleapis.com'));
+    expect(maps?.layer).toBe('EXTERNAL');
+  });
+
+  it('maps react-router routes to SCREEN nodes (incl. lazy)', () => {
+    const screens = g.nodes.filter((n) => n.layer === 'SCREEN');
+    const map = Object.fromEntries(screens.map((s) => [s.method, s.endpoint]));
+    expect(map['UserPage']).toBe('/users/{}');
+    expect(map['OrdersPage']).toBe('/orders');
+    expect(map['ReportPage']).toBe('/report'); // lazy(() => import(...)) resolved
+  });
+
+  it('detects redux / zustand / context stores (no axios false-positive)', () => {
+    const stores = g.nodes.filter((n) => n.layer === 'STORE').map((n) => n.id);
+    expect(stores).toContain('store:redux:user');
+    expect(stores).toContain('store:zustand:useCartStore');
+    expect(stores).toContain('store:context:AuthContext');
+    expect(stores.some((s) => s.includes('http'))).toBe(false);
+  });
+
+  it('wires component→hook (call), component→child (render), store edges', () => {
+    const rels = new Set(g.edges.map((e) => e.relation));
+    expect(rels.has('render')).toBe(true);
+    expect(rels.has('call')).toBe(true);
+    expect(rels.has('http')).toBe(true);
+    expect(rels.has('store:read')).toBe(true);
+    expect(rels.has('dispatch')).toBe(true);
+  });
+
+  it('joins to the backend controllers when the combined graph is present', () => {
+    if (!fs.existsSync(BACKEND)) {
+      // backend graph not generated in this checkout — skip the cross-repo assertion
+      return;
+    }
+    const backend = jsonOutput.read(fs.readFileSync(BACKEND, 'utf8'));
+    const r = join(g, backend);
+    const byPath = Object.fromEntries(r.links.map((l) => [`${l.httpMethod} ${l.normalizedPath}`, l]));
+    expect(byPath['GET /internal/users/{}'].matchStatus).toBe('matched');
+    expect(byPath['GET /internal/users/{}'].backendProject).toBe('user-service');
+    expect(byPath['POST /orders/{}/notify'].matchStatus).toBe('matched');
+    expect(byPath['POST /orders'].matchStatus).toBe('ambiguous');
+    expect(byPath['GET /maps/api/geocode/json'].matchStatus).toBe('unmatched');
+    expect(r.meta.matched).toBeGreaterThanOrEqual(3);
+  });
+});

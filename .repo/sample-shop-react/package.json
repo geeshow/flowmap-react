@@ -1,0 +1,14 @@
+{
+  "name": "sample-shop-react",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0",
+    "@reduxjs/toolkit": "^2.2.0",
+    "react-redux": "^9.1.0",
+    "zustand": "^4.5.0",
+    "axios": "^1.7.0"
+  }
+}

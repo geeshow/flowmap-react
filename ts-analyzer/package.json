@@ -1,0 +1,28 @@
+{
+  "name": "flowmap-react",
+  "version": "0.1.0",
+  "description": "Precise React static analyzer — emits a node-link graph of screens, components, API calls and stores, and joins it to a flowmap-spring backend graph.",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "bin": {
+    "flowmap-react": "dist/cli.js"
+  },
+  "main": "dist/cli.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "cli": "ts-node src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "ts-node": "^10.9.2",
+    "vitest": "^2.1.4"
+  }
+}

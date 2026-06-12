@@ -1,0 +1,18 @@
+# dependencies / build artifacts
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+
+# Analysis target projects: only the demo fixture is committed.
+# Real targets (including large internal apps) stay local and are never published.
+/.repo/*
+!/.repo/sample-shop-react/
+
+# Analysis outputs (graphs / join / screens JSON)
+/json/*.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
