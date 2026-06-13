@@ -58,4 +58,44 @@ describe('join', () => {
     const r = join(front, backend());
     expect(r.meta.unmatched).toBe(2);
   });
+
+  // ---- gateway fallback: public path the gateway rewrites before the backend ----
+
+  function gatewayBackend(): CallGraph {
+    return {
+      nodes: [
+        // backend controller serves the REWRITTEN path (gateway stripped /api)
+        makeNode({ id: 'sib#get', fqcn: 'SibController', method: 'getCustomer', layer: 'CONTROLLER', httpMethod: 'GET', endpoint: '/sib/customers/{}', project: 'bank-broker' }),
+        // gateway route node carries the PUBLIC prefix
+        makeNode({ id: 'gateway:gw#sib', fqcn: 'gw', method: 'sib', layer: 'GATEWAY', httpMethod: null, endpoint: '/api/sib', externalService: 'bank-broker', project: 'gw' }),
+        makeNode({ id: 'gateway:gw#root', fqcn: 'gw', method: 'root', layer: 'GATEWAY', httpMethod: null, endpoint: '/', project: 'gw' }),
+      ],
+      edges: [],
+    };
+  }
+
+  it('falls back to a gateway when the public path is rewritten before the backend', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'GET', endpoint: '/api/sib/customers/{}' })], edges: [] };
+    const r = join(front, gatewayBackend());
+    expect(r.meta.matched).toBe(1);
+    expect(r.meta.viaGateway).toBe(1);
+    expect(r.links[0].via).toBe('gateway');
+    expect(r.links[0].backendNodeId).toBe('gateway:gw#sib');
+  });
+
+  it('prefers a direct controller match over the gateway', () => {
+    // a frontend call straight to the rewritten path resolves to the controller, not the gateway
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'GET', endpoint: '/sib/customers/{}' })], edges: [] };
+    const r = join(front, gatewayBackend());
+    expect(r.meta.matched).toBe(1);
+    expect(r.links[0].via).toBe('direct');
+    expect(r.links[0].backendNodeId).toBe('sib#get');
+  });
+
+  it('does not let a catch-all `/` gateway greedily claim every call', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'GET', endpoint: '/unknown/thing' })], edges: [] };
+    const r = join(front, gatewayBackend());
+    expect(r.meta.unmatched).toBe(1);
+    expect(r.links[0].via).toBeNull();
+  });
 });

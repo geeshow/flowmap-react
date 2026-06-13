@@ -124,7 +124,7 @@ function cmdJoin(opts: Opts): void {
   if (opts.flags['--out']) {
     fs.writeFileSync(opts.flags['--out'], text);
     process.stderr.write(
-      `wrote ${opts.flags['--out']}: ${result.meta.matched} matched, ${result.meta.unmatched} unmatched, ${result.meta.ambiguous} ambiguous\n`,
+      `wrote ${opts.flags['--out']}: ${result.meta.matched} matched (${result.meta.viaGateway} via gateway), ${result.meta.unmatched} unmatched, ${result.meta.ambiguous} ambiguous\n`,
     );
     refreshManifest(opts.flags['--out']);
   } else {

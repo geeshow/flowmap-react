@@ -17,6 +17,7 @@ export type Layer =
   | 'BATCH'
   | 'EXTERNAL'
   | 'RESOURCE'
+  | 'GATEWAY' // backend Spring Cloud Gateway route node (carries the public prefix)
   | 'OTHER'
   // frontend
   | 'SCREEN'
@@ -24,7 +25,7 @@ export type Layer =
   | 'STORE'
   | 'API';
 
-export type EdgeKind = 'internal' | 'external' | 's2s' | 'batch' | 'resource';
+export type EdgeKind = 'internal' | 'external' | 's2s' | 'batch' | 'resource' | 'gateway';
 
 export type CallMode = 'sync' | 'async';
 

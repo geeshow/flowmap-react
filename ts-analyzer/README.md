@@ -27,8 +27,10 @@ npm run build          # dist/ 생성 (또는 npm run cli -- <args> 로 ts-node 
 node dist/cli.js analyze --repo ../.repo --project sample-shop-react --out ../json/front.json
 
 # 백엔드 그래프와 조인 (별도 조인 파일 생성, 그래프는 병합하지 않음)
+# 프론트 API 호출을 ① 백엔드 컨트롤러에 직접, 안 되면 ② 게이트웨이 공개 prefix에 매칭
+# (게이트웨이가 경로를 재작성하므로 직접 매칭이 깨지는 호출은 GATEWAY 노드를 거쳐 이어짐)
 node dist/cli.js join --graph ../json/front.json \
-  --backend ../../flowmap-spring-kotlin/kotlin-analyzer/json/_combined.json \
+  --backend ../../flowmap-spring-kotlin/json/_combined.json \
   --out ../json/join.json
 
 # 커버리지/통계
@@ -100,7 +102,7 @@ src/
   classify.ts        # 클라이언트/스토어/라우터 시그니처 테이블 (Classify.kt)
   jsonOutput.ts      # 그래프 읽기/쓰기 (JsonOutput.kt)
   graphBuilder.ts    # 순수 IR → 그래프 (GraphBuilder.kt)
-  join.ts            # 프론트 → 백엔드 조인 (CrossRun.kt의 매칭 로직)
+  join.ts            # 프론트 → 백엔드 조인: 컨트롤러 직접 매칭 + 게이트웨이 공개 prefix fallback
   bfs.ts             # search 서브그래프 (Bfs.kt)
   cli.ts             # analyze/join/search/stats (Cli.kt)
   resolver/
