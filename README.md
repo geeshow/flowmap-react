@@ -68,6 +68,39 @@ node dist/cli.js search --graph ../json/front.json --method UserPage --direction
 React/Vue를 자동 판별해 알맞은 리졸버를 적용합니다. Vue/Nuxt는 `--mode development|production`으로
 `config/<mode>.json`의 env(API_HOST/API_VERSION)를 선택합니다(기본 development).
 
+### 레포 루트에서 바로 실행
+
+`ts-analyzer/`로 들어가지 않고 **flowmap-react 루트**에서 실행할 수 있습니다.
+
+```bash
+npm run build            # ts-analyzer 설치 + 빌드
+./flowmap analyze --repo .repo --project <P> --out json/front.json
+./flowmap screens --repo .repo --project <P> --out json/screens.json
+./flowmap join --graph json/front.json --backend <backend>.json --out json/join.json
+# npm 스크립트로도 가능: npm run analyze -- --repo .repo --project <P> --out ...
+```
+
+### 대용량 저장소 / 메모리 (OOM 방지)
+
+수천 개 컴포넌트 규모의 워크스페이스는 단일 `ts.Program`이 Node 기본 힙(~2–4GB)을 넘겨
+`JavaScript heap out of memory`로 죽을 수 있습니다. 분석기는 이를 두 방식으로 자동 처리합니다.
+
+- **힙 자동 확장**: `analyze`/`screens`/`search`/`stats`는 힙 플래그가 없으면 물리 RAM의 ~75%
+  (최소 4GB)로 자기 자신을 재실행합니다. 별도 플래그 불필요.
+- **프로젝트 루트 분할**: 저장소/모노레포 워크스페이스를 (디렉터리 구조와 무관하게 `package.json`의
+  `workspaces`·프레임워크 의존성 기준으로) 하위 프로젝트 루트로 분해해 **각 루트를 별도 자식
+  프로세스**로 분석합니다. 거대한 `ts.Program`의 메모리가 프로세스 종료 시 회수되고, 부모는 가벼운
+  IR만 병합해 그래프를 한 번 만듭니다. 결과 그래프는 단일 프로세스 분석과 바이트 단위로 동일합니다.
+
+```bash
+FLOWMAP_MAX_OLD_SPACE=12288 ./flowmap analyze ...   # 프로세스당 힙(MB) 직접 지정
+./flowmap analyze ... --workers 4                    # 동시 실행 자식 프로세스 수
+./flowmap analyze ... --no-split                      # 분할 끄고 단일 프로세스로
+```
+
+> 워크스페이스가 단일 패키지(하위 멤버 없음)라 분할이 안 되는 경우에는 힙 자동 확장만으로 처리합니다.
+> RAM이 부족하면 `--workers`를 줄이고 `FLOWMAP_MAX_OLD_SPACE`로 프로세스당 힙을 조절하세요.
+
 ---
 
 ## 저장소 구성
