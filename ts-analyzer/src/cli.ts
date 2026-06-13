@@ -8,6 +8,7 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { bfs, Direction, findNodes } from './bfs';
 import { GraphBuilder } from './graphBuilder';
 import { join as joinGraphs } from './join';
@@ -75,6 +76,18 @@ function dump(graph: CallGraph, out: string | undefined, meta: Record<string, un
   }
 }
 
+/** Rescan the output directory of `out` and (re)write `_manifest.json`. */
+function refreshManifest(out: string | undefined): void {
+  if (!out) return;
+  const dir = path.dirname(out) || '.';
+  try {
+    jsonOutput.writeManifest(dir);
+    process.stderr.write(`wrote ${path.join(dir, '_manifest.json')}\n`);
+  } catch (e) {
+    process.stderr.write(`manifest: ${(e as Error).message}\n`);
+  }
+}
+
 function cmdAnalyze(opts: Opts): void {
   const { graph, fileCount, repo } = analyzeRepo(opts);
   dump(graph, opts.flags['--out'], {
@@ -85,6 +98,7 @@ function cmdAnalyze(opts: Opts): void {
     nodes: graph.nodes.length,
     edges: graph.edges.length,
   });
+  refreshManifest(opts.flags['--out']);
 }
 
 function cmdJoin(opts: Opts): void {
@@ -112,6 +126,7 @@ function cmdJoin(opts: Opts): void {
     process.stderr.write(
       `wrote ${opts.flags['--out']}: ${result.meta.matched} matched, ${result.meta.unmatched} unmatched, ${result.meta.ambiguous} ambiguous\n`,
     );
+    refreshManifest(opts.flags['--out']);
   } else {
     process.stdout.write(text + '\n');
   }
@@ -156,6 +171,7 @@ function cmdScreens(opts: Opts): void {
   if (opts.flags['--out']) {
     fs.writeFileSync(opts.flags['--out'], text);
     process.stderr.write(`wrote ${opts.flags['--out']}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
+    refreshManifest(opts.flags['--out']);
   } else {
     process.stdout.write(text + '\n');
   }
