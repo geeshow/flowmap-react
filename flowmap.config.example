@@ -5,9 +5,13 @@
 # 분석 대상 소스 체크아웃 루트 (.repo/<project>/ 관례)
 REPO=.repo
 
-# 분석할 프로젝트 (생략 시 REPO 아래 전체). 출력 파일명의 베이스가 됩니다:
-#   <OUT_DIR>/<PROJECT>.json , .screens.json , .join.json
-PROJECT=fe-service-workspace
+# PROJECT 를 지정하지 않으면 REPO(.repo) 아래의 모든 프로젝트를 한 번에 분석합니다.
+# 특정 프로젝트만 분석하려면 주석을 해제하세요.
+#   PROJECT=fe-service-workspace
+
+# 출력 파일명 베이스 (없으면 PROJECT, 그것도 없으면 graph):
+#   <OUT_DIR>/<NAME>.json , .screens.json , .join.json
+NAME=graph
 
 # 결과 JSON을 모아둘 디렉터리 (없으면 자동 생성)
 OUT_DIR=/Users/rnd-20240067-ken/kakao/flowmap5/docs/web/data
@@ -19,6 +23,7 @@ BACKEND=${OUT_DIR}/_combined.json
 MODE=development
 
 # 분석 전 git pull --ff-only 로 체크아웃 최신화 (true/false)
+# PROJECT 미지정(전체 분석) 시 REPO(.repo) 루트가 git 저장소면 그곳을 pull 합니다.
 PULL=true
 
 # --- 선택: 대용량 저장소 메모리 튜닝 ---

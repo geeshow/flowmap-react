@@ -239,7 +239,8 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
 
   fs.mkdirSync(outDir, { recursive: true });
-  const base = project ?? 'graph';
+  // Output file base: explicit NAME, else PROJECT, else "graph" (whole-repo run).
+  const base = pick('--name', 'NAME') || project || 'graph';
   const graphOut = path.join(outDir, `${base}.json`);
   const screensOut = path.join(outDir, `${base}.screens.json`);
   const joinOut = path.join(outDir, `${base}.join.json`);
