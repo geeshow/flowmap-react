@@ -13,7 +13,7 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS } from '../classify';
+import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, isComponentName, isHookName } from '../classify';
 import type { ApiResolution } from '../ir';
 import type { Confidence } from '../model';
 import { normalize } from '../norm';
@@ -156,6 +156,11 @@ export class ApiCallResolver {
   private traceWrapper(call: ts.CallExpression, visited: Set<ts.Node>): ApiResolution | null {
     const callee = call.expression;
     const calleeName = this.calleeName(callee);
+    // Only trace through plain utility functions. Components/hooks are their own graph
+    // nodes and represent their HTTP edges directly — absorbing them into the caller would
+    // turn a component→hook `call` edge into a spurious `http` edge.
+    const simpleName = calleeName ? calleeName.split('.').pop()! : null;
+    if (simpleName && (isComponentName(simpleName) || isHookName(simpleName))) return null;
     const decl = this.functionDeclOf(callee);
     if (!decl || visited.has(decl)) return null;
     if (!this.isProjectNode(decl)) return null;
@@ -164,21 +169,97 @@ export class ApiCallResolver {
     const body = (decl as ts.FunctionLikeDeclaration).body;
     if (!body) return null;
 
+    // 1) A direct axios/fetch/instance call inside this wrapper.
     const inner = this.findInnerHttpCall(body);
-    if (!inner) return null;
+    if (inner) {
+      const raw = inner.raw;
+      // Bind the wrapper's URL to the caller's argument when it derives from a parameter —
+      // a positional one (`fn(url)`), a destructured one (`fn({ url })`), or a config-object
+      // property (`fn(cfg)` → `cfg.url`). Otherwise keep the literal URL from the wrapper body.
+      const bound = this.bindParamExpr(raw.urlExpr, decl, call);
+      const boundRaw: RawHttp = { ...raw, urlExpr: bound ?? raw.urlExpr, service: calleeName ?? raw.service };
+      const innerMethodName = this.calleeName(inner.call.expression) ?? raw.service ?? 'http';
+      return this.buildFromRaw(boundRaw, call, [calleeName ?? '?', innerMethodName]);
+    }
 
-    const raw = inner.raw;
-    // If the wrapper's URL is exactly one of its parameters, bind the caller's argument.
-    let urlExpr = raw.urlExpr;
-    if (urlExpr && ts.isIdentifier(urlExpr)) {
-      const paramIndex = this.paramIndexOf(decl, urlExpr);
-      if (paramIndex >= 0 && call.arguments[paramIndex]) {
-        urlExpr = call.arguments[paramIndex];
+    // 2) No direct HTTP call — follow a nested custom wrapper one level deeper
+    //    (component → fetchAccountOpenable → fetchData → fetch).
+    const nested = this.findNestedWrapperResolution(body, visited);
+    if (nested) return { ...nested, wrapperChain: [calleeName ?? '?', ...nested.wrapperChain] };
+    return null;
+  }
+
+  /** First nested wrapper call whose own tracing yields an HTTP resolution (depth-first). */
+  private findNestedWrapperResolution(body: ts.Node, visited: Set<ts.Node>): ApiResolution | null {
+    let found: ApiResolution | null = null;
+    const visit = (node: ts.Node) => {
+      if (found) return;
+      if (ts.isCallExpression(node)) {
+        const res = this.traceWrapper(node, visited);
+        if (res) {
+          found = res;
+          return;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(body, visit);
+    return found;
+  }
+
+  /**
+   * Substitute a parameter-derived URL expression with the matching call-site argument,
+   * so a caller's URL flows into the wrapper's inner HTTP call. Returns null when the URL
+   * is not parameter-derived (e.g. a literal in the wrapper body), leaving it untouched.
+   */
+  private bindParamExpr(
+    expr: ts.Expression | undefined,
+    decl: ts.FunctionLikeDeclaration,
+    call: ts.CallExpression,
+  ): ts.Expression | null {
+    if (!expr) return null;
+
+    // `fn(url)` or `fn({ url })` → the inner URL is a bare identifier.
+    if (ts.isIdentifier(expr)) {
+      const sym = this.checker.getSymbolAtLocation(expr);
+      const target = sym?.valueDeclaration ?? sym?.declarations?.[0];
+      if (!target) return null;
+      const pIdx = decl.parameters.indexOf(target as ts.ParameterDeclaration);
+      if (pIdx >= 0) return call.arguments[pIdx] ?? null; // positional param
+      if (ts.isBindingElement(target)) return this.bindFromDestructured(target, decl, call);
+      return null;
+    }
+
+    // `fn(cfg)` → inner URL is `cfg.url`; map to the `url` property of the caller's object arg.
+    if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression)) {
+      const recvSym = this.checker.getSymbolAtLocation(expr.expression);
+      const recvDecl = recvSym?.valueDeclaration ?? recvSym?.declarations?.[0];
+      const pIdx = recvDecl ? decl.parameters.indexOf(recvDecl as ts.ParameterDeclaration) : -1;
+      if (pIdx >= 0) {
+        const arg = call.arguments[pIdx];
+        if (arg && ts.isObjectLiteralExpression(arg)) return this.propExpr(arg, expr.name.text) ?? null;
       }
     }
-    const boundRaw: RawHttp = { ...raw, urlExpr, service: calleeName ?? raw.service };
-    const innerMethodName = this.calleeName(inner.call.expression) ?? raw.service ?? 'http';
-    return this.buildFromRaw(boundRaw, call, [calleeName ?? '?', innerMethodName]);
+    return null;
+  }
+
+  /** A destructured-param binding (`fn({ url })` / `fn({ url: u })`) → caller's object property. */
+  private bindFromDestructured(
+    be: ts.BindingElement,
+    decl: ts.FunctionLikeDeclaration,
+    call: ts.CallExpression,
+  ): ts.Expression | null {
+    const key = be.propertyName ? this.propName(be.propertyName) : ts.isIdentifier(be.name) ? be.name.text : null;
+    if (!key) return null;
+    // Walk up to the owning parameter (skip if it's a local destructure, not a param).
+    let node: ts.Node = be;
+    while (node.parent && !ts.isParameter(node)) node = node.parent;
+    if (!ts.isParameter(node)) return null;
+    const pIdx = decl.parameters.indexOf(node);
+    if (pIdx < 0) return null;
+    const arg = call.arguments[pIdx];
+    if (arg && ts.isObjectLiteralExpression(arg)) return this.propExpr(arg, key) ?? null;
+    return null;
   }
 
   /** First HTTP call inside a function body (depth-first). */
@@ -305,28 +386,40 @@ export class ApiCallResolver {
 
     let info: InstanceInfo | null = null;
     const decl = sym.valueDeclaration ?? sym.declarations?.[0];
-    if (decl && ts.isVariableDeclaration(decl) && decl.initializer && ts.isCallExpression(decl.initializer)) {
-      const init = decl.initializer;
-      if (
-        ts.isPropertyAccessExpression(init.expression) &&
-        init.expression.name.text === 'create' &&
-        this.isAxiosImport(init.expression.expression)
-      ) {
-        const cfg = init.arguments[0];
-        let baseUrl: EvalString | null = null;
-        if (cfg && ts.isObjectLiteralExpression(cfg)) {
-          const baseExpr = this.propExpr(cfg, 'baseURL');
-          if (baseExpr) baseUrl = this.constEval.evalString(baseExpr);
-        }
-        info = {
-          name: ts.isIdentifier(decl.name) ? decl.name.text : null,
-          baseUrl,
-          clientPackage: this.relOf(decl),
-        };
+    // `const x = axios.create({...})` or `export default axios.create({...})`.
+    const init = this.axiosCreateInitOf(decl);
+    if (decl && init) {
+      const cfg = init.arguments[0];
+      let baseUrl: EvalString | null = null;
+      if (cfg && ts.isObjectLiteralExpression(cfg)) {
+        const baseExpr = this.propExpr(cfg, 'baseURL');
+        if (baseExpr) baseUrl = this.constEval.evalString(baseExpr);
       }
+      info = {
+        name: ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name) ? decl.name.text : null,
+        baseUrl,
+        clientPackage: this.relOf(decl),
+      };
     }
     this.instanceCache.set(sym, info);
     return info;
+  }
+
+  /** The `axios.create(...)` call backing a declaration, whether a `const` or `export default`. */
+  private axiosCreateInitOf(decl: ts.Node | undefined): ts.CallExpression | null {
+    if (!decl) return null;
+    let expr: ts.Expression | undefined;
+    if (ts.isVariableDeclaration(decl)) expr = decl.initializer;
+    else if (ts.isExportAssignment(decl)) expr = decl.expression;
+    if (!expr || !ts.isCallExpression(expr)) return null;
+    if (
+      ts.isPropertyAccessExpression(expr.expression) &&
+      expr.expression.name.text === 'create' &&
+      this.isAxiosImport(expr.expression.expression)
+    ) {
+      return expr;
+    }
+    return null;
   }
 
   private functionDeclOf(callee: ts.Expression): ts.FunctionLikeDeclaration | null {
@@ -346,13 +439,6 @@ export class ApiCallResolver {
       if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) return init;
     }
     return null;
-  }
-
-  private paramIndexOf(decl: ts.FunctionLikeDeclaration, id: ts.Identifier): number {
-    const sym = this.checker.getSymbolAtLocation(id);
-    if (!sym) return -1;
-    const target = sym.valueDeclaration ?? sym.declarations?.[0];
-    return decl.parameters.findIndex((p) => p === target);
   }
 
   private calleeName(callee: ts.Expression): string | null {

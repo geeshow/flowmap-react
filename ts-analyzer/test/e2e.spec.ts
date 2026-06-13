@@ -45,6 +45,32 @@ describe('e2e on sample-shop-react', () => {
     expect(eps).toContain('GET /internal/investment/current-summary');
   });
 
+  it('resolves a 2-level custom wrapper with a config-object URL (fetchData pattern)', () => {
+    // component → fetchAccountOpenable → fetchData({ url }) → http.get(url)
+    // URL is NIFFLER_API_URL.ACCOUNT_OPENABLE (object member over nested template literals).
+    const acct = httpNodes.find((n) => n.endpoint === '/account/v1/account-openable');
+    expect(acct).toBeTruthy();
+    expect(acct!.httpMethod).toBe('GET');
+    expect(acct!.externalUrl).toBe('https://api.shop.com/account/v1/account-openable');
+    expect(acct!.confidence).toBe('resolved');
+  });
+
+  it('resolves a React-Query options factory (queryFn + stringifyUrl + default-export axios)', () => {
+    // useAccountListQuery → accountListQueryOptions → queryOptions({ queryFn: () => accountAxios.get(url) })
+    // url = queryString.stringifyUrl({ url: NIFFLER_API_URL.ACCOUNT_LIST, query }) (local const).
+    const list = httpNodes.find((n) => n.endpoint === '/account/v1/account-list');
+    expect(list).toBeTruthy();
+    expect(list!.httpMethod).toBe('GET');
+    expect(list!.externalUrl).toBe('https://api.shop.com/account/v1/account-list');
+  });
+
+  it('resolves a URL pulled from a local object destructure (const { url } = config)', () => {
+    const terms = httpNodes.find((n) => n.endpoint === '/account/v1/service-terms');
+    expect(terms).toBeTruthy();
+    expect(terms!.httpMethod).toBe('GET');
+    expect(terms!.externalUrl).toBe('https://api.shop.com/account/v1/service-terms');
+  });
+
   it('marks a bare fetch as partial (verb defaulted)', () => {
     const f = httpNodes.find((n) => n.endpoint === '/orders' && n.layer === 'API');
     expect(f).toBeTruthy();

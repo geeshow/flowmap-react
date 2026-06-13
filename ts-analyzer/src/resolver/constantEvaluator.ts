@@ -63,6 +63,26 @@ export class ConstantEvaluator {
     if (!node || depth > 16) return NONE;
     const direct = this.evalString(node, depth);
     if (direct.value != null) return direct;
+
+    // `const url = stringifyUrl({...})` / `const url = build(...)` → follow the local
+    // const to its initializer and dig the URL out of the builder call.
+    if (ts.isIdentifier(node)) {
+      const init = this.initializerOf(node);
+      return init ? this.resolveUrlBuildingCall(init, depth + 1) : NONE;
+    }
+
+    // stringifyUrl({ url, query }) / fetch-config { url } → prefer a url-like property
+    // (object-literal properties are not Expressions, so forEachChild would skip them).
+    if (ts.isObjectLiteralExpression(node)) {
+      for (const key of ['url', 'path', 'endpoint', 'uri']) {
+        const e = this.propInit(node, key);
+        if (e) {
+          const r = this.resolveUrlBuildingCall(e, depth + 1);
+          if (r.value != null) return r;
+        }
+      }
+    }
+
     let result: EvalString = NONE;
     node.forEachChild((child) => {
       if (result.value != null) return;
@@ -130,9 +150,56 @@ export class ConstantEvaluator {
     // a function parameter is a runtime value, not a constant
     const decl = sym.valueDeclaration ?? sym.declarations?.[0];
     if (decl && ts.isParameter(decl)) return NONE;
+    // destructured local: `const { url } = source` → resolve `source.url`.
+    if (decl && ts.isBindingElement(decl)) {
+      const r = this.resolveBindingElement(decl, depth);
+      if (r.value != null) return r;
+    }
     const init = this.initializerOfSymbol(sym);
     if (init) return this.evalString(init, depth + 1);
     return NONE;
+  }
+
+  /** `const { url } = source` / `const { url: u } = source` → evaluate the source's property. */
+  private resolveBindingElement(be: ts.BindingElement, depth: number): EvalString {
+    const key = be.propertyName ? this.propName(be.propertyName) : ts.isIdentifier(be.name) ? be.name.text : null;
+    if (!key) return NONE;
+    const pattern = be.parent;
+    if (!ts.isObjectBindingPattern(pattern)) return NONE;
+    // Only local destructures are constant; a destructured parameter is a runtime value.
+    const owner = pattern.parent;
+    if (ts.isVariableDeclaration(owner) && owner.initializer) {
+      return this.evalPropertyOf(owner.initializer, key, depth);
+    }
+    return NONE;
+  }
+
+  /** Resolve `<obj>.<key>` where obj is an object literal (following a const identifier first). */
+  private evalPropertyOf(objExpr: ts.Expression, key: string, depth: number): EvalString {
+    let obj: ts.Expression | undefined = objExpr;
+    if (ts.isIdentifier(obj)) obj = this.initializerOf(obj) ?? obj;
+    if (obj && ts.isObjectLiteralExpression(obj)) {
+      const e = this.propInit(obj, key);
+      if (e) return this.evalString(e, depth + 1);
+    }
+    return NONE;
+  }
+
+  private initializerOf(node: ts.Expression): ts.Expression | undefined {
+    return this.initializerOfSymbol(this.symbolAt(node));
+  }
+
+  private propName(name: ts.PropertyName): string | null {
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) return name.text;
+    return null;
+  }
+
+  private propInit(obj: ts.ObjectLiteralExpression, key: string): ts.Expression | undefined {
+    for (const p of obj.properties) {
+      if (ts.isPropertyAssignment(p) && this.propName(p.name) === key) return p.initializer;
+      if (ts.isShorthandPropertyAssignment(p) && p.name.text === key) return p.name;
+    }
+    return undefined;
   }
 
   /** Returns the env var name for import.meta.env.X / process.env.X, else null. */
