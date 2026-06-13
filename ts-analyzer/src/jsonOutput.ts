@@ -45,18 +45,24 @@ export function writeManifest(outDir: string): string {
     .filter((f) => !MANIFEST_SUFFIXES.some((s) => f.endsWith(s)))
     .sort();
 
+  // Frontend-only node layers — their presence marks a graph as a frontend graph.
+  const FRONTEND_LAYERS = new Set(['SCREEN', 'HOOK', 'STORE', 'API']);
+
   const projects = entries.map((graphFile) => {
     const base = graphFile.slice(0, -'.json'.length);
-    const joinFile = `${base}.join.json`;
-    const screensFile = `${base}.screens.json`;
+    const sibling = (suffix: string) => (fs.existsSync(path.join(outDir, `${base}.${suffix}`)) ? `${base}.${suffix}` : null);
 
     let nodes = 0;
     let edges = 0;
+    let isFrontend = false;
     let generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     try {
       const root = JSON.parse(fs.readFileSync(path.join(outDir, graphFile), 'utf8'));
       nodes = int(root.meta, 'nodes') ?? (Array.isArray(root.nodes) ? root.nodes.length : 0);
       edges = int(root.meta, 'edges') ?? (Array.isArray(root.edges) ? root.edges.length : 0);
+      // Detect type from node layers so a shared dir holding BOTH backend and
+      // frontend graphs is catalogued correctly no matter which tool wrote last.
+      isFrontend = Array.isArray(root.nodes) && root.nodes.some((n: { layer?: string }) => n.layer != null && FRONTEND_LAYERS.has(n.layer));
       const g = str(root.meta, 'generated');
       if (g) generated = g;
     } catch {
@@ -65,12 +71,12 @@ export function writeManifest(outDir: string): string {
 
     return {
       name: base,
-      type: 'frontend',
+      type: isFrontend ? 'frontend' : 'backend',
       graph: graphFile,
-      join: fs.existsSync(path.join(outDir, joinFile)) ? joinFile : null,
-      screens: fs.existsSync(path.join(outDir, screensFile)) ? screensFile : null,
-      openapi: null,
-      impact: null,
+      openapi: sibling('openapi.json'),
+      impact: sibling('impact.json'),
+      join: sibling('join.json'),
+      screens: sibling('screens.json'),
       nodes,
       edges,
       generated,
