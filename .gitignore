@@ -4,10 +4,11 @@ dist/
 *.tsbuildinfo
 *.log
 
-# Analysis target projects: only the demo fixture is committed.
+# Analysis target projects: only the small demo fixtures are committed.
 # Real targets (including large internal apps) stay local and are never published.
 /.repo/*
 !/.repo/sample-shop-react/
+!/.repo/sample-shop-nuxt/
 
 # Analysis outputs (graphs / join / screens JSON)
 /json/*.json

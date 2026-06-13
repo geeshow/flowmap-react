@@ -18,14 +18,15 @@ import type { ApiResolution } from '../ir';
 import type { Confidence } from '../model';
 import { normalize } from '../norm';
 import { ConstantEvaluator, EvalString } from './constantEvaluator';
+import { realFileName } from './program';
 
-interface InstanceInfo {
+export interface InstanceInfo {
   name: string | null;
   baseUrl: EvalString | null;
   clientPackage: string | null;
 }
 
-interface RawHttp {
+export interface RawHttp {
   method: string | null;
   verbConfident: boolean;
   urlExpr: ts.Expression | undefined;
@@ -56,7 +57,7 @@ export class ApiCallResolver {
 
   // ---- direct client classification ----
 
-  private classifyHttpCall(call: ts.CallExpression): RawHttp | null {
+  protected classifyHttpCall(call: ts.CallExpression): RawHttp | null {
     const callee = call.expression;
 
     // fetch(url, opts)
@@ -112,7 +113,7 @@ export class ApiCallResolver {
   }
 
   /** axios({ method, url }) / instance.request({ method, url }) form. */
-  private configForm(call: ts.CallExpression, inst: InstanceInfo): RawHttp {
+  protected configForm(call: ts.CallExpression, inst: InstanceInfo): RawHttp {
     const cfg = call.arguments[0];
     const m = this.methodFromConfig(cfg);
     let urlExpr: ts.Expression | undefined;
@@ -368,6 +369,6 @@ export class ApiCallResolver {
   }
 
   private relOf(node: ts.Node): string {
-    return path.relative(this.repoRoot, node.getSourceFile().fileName).split(path.sep).join('/');
+    return path.relative(this.repoRoot, realFileName(node.getSourceFile().fileName)).split(path.sep).join('/');
   }
 }

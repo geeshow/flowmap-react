@@ -20,9 +20,14 @@ export interface ProjectProgram {
   repoRoot: string; // absolute repo root, for repo-relative paths
 }
 
+/** Strip the synthetic ".ts" the Vue program appends to ".vue" files (foo.vue.ts → foo.vue). */
+export function realFileName(file: string): string {
+  return file.endsWith('.vue.ts') ? file.slice(0, -3) : file;
+}
+
 /** repo-relative path with forward slashes, e.g. "sample-shop-react/src/api/user.ts". */
 export function repoRel(repoRoot: string, file: string): string {
-  return path.relative(repoRoot, file).split(path.sep).join('/');
+  return path.relative(repoRoot, realFileName(file)).split(path.sep).join('/');
 }
 
 /** provenance: project = parts[0], module = parts[1] (if it looks like a module dir). */
@@ -31,12 +36,13 @@ export function provenance(rel: string): { project: string | null; module: strin
   return { project: parts[0] ?? null, module: parts.length > 2 ? parts[1] : null };
 }
 
-function isSourceFile(name: string): boolean {
-  return SOURCE_EXTENSIONS.some((e) => name.endsWith(e)) && !name.endsWith('.d.ts');
+function isSourceFile(name: string, extraExts: string[]): boolean {
+  if (name.endsWith('.d.ts')) return false;
+  return SOURCE_EXTENSIONS.some((e) => name.endsWith(e)) || extraExts.some((e) => name.endsWith(e));
 }
 
-/** Recursively collect source files under a dir, skipping SKIP_DIRS. */
-export function collectSourceFiles(root: string): string[] {
+/** Recursively collect source files under a dir, skipping SKIP_DIRS. `extraExts` adds e.g. ['.vue']. */
+export function collectSourceFiles(root: string, extraExts: string[] = []): string[] {
   const out: string[] = [];
   const walk = (dir: string) => {
     let entries: fs.Dirent[];
@@ -49,7 +55,7 @@ export function collectSourceFiles(root: string): string[] {
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
         if (!SKIP_DIRS.has(e.name)) walk(full);
-      } else if (e.isFile() && isSourceFile(e.name)) {
+      } else if (e.isFile() && isSourceFile(e.name, extraExts)) {
         out.push(full);
       }
     }
@@ -73,6 +79,38 @@ export function isReactProject(rootDir: string): boolean {
     }
   }
   return collectSourceFiles(rootDir).some((f) => f.endsWith('.tsx') || f.endsWith('.jsx'));
+}
+
+/** A Vue/Nuxt project: `vue`/`nuxt` in package.json deps, or any `.vue` file present. */
+export function isVueProject(rootDir: string): boolean {
+  const pkgPath = path.join(rootDir, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      if (deps.vue || deps.nuxt) return true;
+      if (deps.react || deps.next || deps['@angular/core']) return false;
+    } catch {
+      /* ignore */
+    }
+  }
+  return collectSourceFiles(rootDir, ['.vue']).length > 0;
+}
+
+/** Discover Vue project roots directly under repoRoot. */
+export function discoverVueProjects(repoRoot: string, projectFilter?: string | null): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(repoRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.isDirectory() && !SKIP_DIRS.has(e.name))
+    .map((e) => e.name)
+    .filter((name) => !projectFilter || name === projectFilter)
+    .map((name) => path.join(repoRoot, name))
+    .filter((dir) => isVueProject(dir));
 }
 
 /** Whether a project uses Next.js (so filesystem routing under pages/ or app/ applies). */

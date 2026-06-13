@@ -14,6 +14,7 @@ import { join as joinGraphs } from './join';
 import * as jsonOutput from './jsonOutput';
 import { CallGraph } from './model';
 import { TsResolver } from './resolver/irBuilder';
+import { VueResolver } from './resolver/vue/vueIrBuilder';
 import { buildScreens } from './screens';
 
 interface Opts {
@@ -46,11 +47,15 @@ function loadEnvFile(path?: string): Record<string, string> {
 
 function analyzeRepo(opts: Opts): { graph: CallGraph; fileCount: number; repo: string } {
   const repo = opts.flags['--repo'] ?? '../.repo';
-  const files = new TsResolver().analyze({
+  const common = {
     repoRoot: repo,
     projectFilter: opts.flags['--project'] ?? null,
     env: loadEnvFile(opts.flags['--env']),
-  });
+  };
+  // React and Vue projects are auto-detected per directory; both emit the same IrFile[].
+  const reactFiles = new TsResolver().analyze(common);
+  const vueFiles = new VueResolver().analyze({ ...common, mode: opts.flags['--mode'] ?? 'development' });
+  const files = [...reactFiles, ...vueFiles];
   const graph = new GraphBuilder(files).build();
   return { graph, fileCount: files.length, repo };
 }
@@ -183,7 +188,7 @@ function usage(): void {
   process.stderr.write(
     [
       'flowmap-react (TypeScript Compiler API)',
-      '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt]',
+      '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--mode development|production]',
       '  join    --graph front.json --backend backend.json [--out join.json]',
       '  search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]',
       '  stats   [--graph g.json | --repo <dir>]',

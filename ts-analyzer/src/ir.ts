@@ -7,9 +7,9 @@
 
 import type { Confidence } from './model';
 
-export type ComponentKind = 'component' | 'hook' | 'function';
-export type StoreKind = 'redux-slice' | 'zustand' | 'context';
-export type RouteSource = 'react-router' | 'next-pages' | 'next-app';
+export type ComponentKind = 'component' | 'hook' | 'function' | 'action';
+export type StoreKind = 'redux-slice' | 'zustand' | 'context' | 'vuex';
+export type RouteSource = 'react-router' | 'next-pages' | 'next-app' | 'nuxt-pages';
 
 /** A use of a child component in JSX (`<UserCard/>`). */
 export interface IrJsxUsage {
@@ -86,6 +86,7 @@ export interface ResolveOptions {
   repoRoot: string;
   projectFilter?: string | null;
   env?: Record<string, string>;
+  mode?: string; // Vue/Nuxt config mode (development|production); ignored by React
 }
 
 export interface Resolver {

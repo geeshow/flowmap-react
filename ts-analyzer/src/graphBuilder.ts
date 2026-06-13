@@ -67,6 +67,22 @@ export class GraphBuilder {
   // ---- node construction ----
 
   private componentNode(c: IrComponent, f: IrFile): MethodNode {
+    // Vuex action: a STORE-layer node that is also an http source (its calls wire to API nodes)
+    if (c.kind === 'action') {
+      return makeNode({
+        id: c.id,
+        fqcn: c.id.split('#')[0], // store:vuex:<ns>
+        method: c.name,
+        layer: 'STORE',
+        resourceType: 'vuex-action',
+        visibility: c.exported ? 'exported' : 'local',
+        isAsync: c.isAsync,
+        file: f.path,
+        line: c.line,
+        project: f.project,
+        module: f.module,
+      });
+    }
     const isScreen = this.screenPath.has(c.id);
     const layer: Layer = isScreen ? 'SCREEN' : c.kind === 'hook' ? 'HOOK' : 'COMPONENT';
     const routePath = this.screenPath.get(c.id) ?? null;
@@ -153,12 +169,13 @@ export class GraphBuilder {
           break;
         }
         case 'storeRead': {
-          if (!this.storeById.has(r.storeId)) this.addPhantomStore(r.storeId, f);
+          this.ensureStoreTarget(r.storeId, f);
           this.emit(c.id, r.storeId, mode, 'internal', 'store:read', f.path, call.line);
           break;
         }
         case 'storeDispatch': {
-          if (!this.storeById.has(r.storeId)) this.addPhantomStore(r.storeId, f);
+          // target may be a Vuex action node (a component) or a store module
+          this.ensureStoreTarget(r.storeId, f);
           this.emit(c.id, r.storeId, mode, 'internal', 'dispatch', f.path, call.line);
           break;
         }
@@ -166,6 +183,12 @@ export class GraphBuilder {
           break;
       }
     }
+  }
+
+  /** Ensure a dispatch/read target exists: an action node (component) or a store module; else phantom. */
+  private ensureStoreTarget(targetId: string, f: IrFile): void {
+    if (this.compById.has(targetId) || this.storeById.has(targetId) || this.nodes.has(targetId)) return;
+    this.addPhantomStore(targetId, f);
   }
 
   /** A store referenced by usage but whose definition we never saw (e.g. external pkg). */

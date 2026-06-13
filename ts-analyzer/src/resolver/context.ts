@@ -8,6 +8,7 @@
 import * as path from 'path';
 import * as ts from 'typescript';
 import { isComponentName } from '../classify';
+import { realFileName } from './program';
 
 export interface ResolvedComponent {
   id: string | null;
@@ -29,7 +30,7 @@ export class AnalysisContext {
   }
 
   repoRel(file: string): string {
-    return path.relative(this.repoRoot, file).split(path.sep).join('/');
+    return path.relative(this.repoRoot, realFileName(file)).split(path.sep).join('/');
   }
 
   isProjectNode(node: ts.Node): boolean {
