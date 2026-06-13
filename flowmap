@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Convenience launcher so the analyzer runs from the flowmap-react repo root.
+#   ./flowmap analyze --repo <dir> --project <P> --out out.json
+#   ./flowmap screens --repo <dir> --project <P> --out out.screens.json
+#   ./flowmap join --graph front.json --backend backend.json --out join.json
+#
+# Heap is managed automatically (the CLI re-execs itself with a larger V8
+# old-space if none is set), and large repos/workspaces are split into one
+# child process per project root. Override with env vars / flags:
+#   FLOWMAP_MAX_OLD_SPACE=12288 ./flowmap analyze ...   # MB per process
+#   ./flowmap analyze ... --workers 4                   # concurrency
+#   ./flowmap analyze ... --no-split                    # single process
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLI="$DIR/ts-analyzer/dist/cli.js"
+
+if [[ ! -f "$CLI" ]]; then
+  echo "flowmap: $CLI not found — building ts-analyzer first…" >&2
+  npm --prefix "$DIR/ts-analyzer" run build >&2
+fi
+
+exec node "$CLI" "$@"

@@ -1,0 +1,33 @@
+# flowmap pipeline 설정 — `pipeline` 명령이 자동으로 읽습니다.
+# 사용법: 이 파일을 `flowmap.config`로 복사한 뒤 값을 채우고  `./flowmap pipeline` 실행.
+# 형식은 KEY=VALUE (주석은 #). 값 안의 ${VAR} 는 위에서 정의한 키/환경변수로 치환됩니다.
+
+# 분석 대상 소스 체크아웃 루트 (.repo/<project>/ 관례)
+REPO=.repo
+
+# PROJECT 를 지정하지 않으면 REPO(.repo) 아래의 모든 프로젝트를 한 번에 분석합니다.
+# 특정 프로젝트만 분석하려면 주석을 해제하세요.
+#   PROJECT=fe-service-workspace
+
+# 출력 파일명 베이스 (없으면 PROJECT, 그것도 없으면 graph):
+#   <OUT_DIR>/<NAME>.json , .screens.json , .join.json
+NAME=graph
+
+# 결과 JSON을 모아둘 디렉터리 (없으면 자동 생성)
+OUT_DIR=/Users/rnd-20240067-ken/kakao/flowmap5/docs/web/data
+
+# 백엔드 결합 그래프 (join 단계 입력). 없거나 파일이 없으면 join 은 건너뜁니다.
+BACKEND=${OUT_DIR}/_combined.json
+
+# Vue/Nuxt env 선택 (development|production). React 는 무시.
+MODE=development
+
+# 분석 전 git pull --ff-only 로 체크아웃 최신화 (true/false)
+# PROJECT 미지정(전체 분석) 시 REPO(.repo) 루트가 git 저장소면 그곳을 pull 합니다.
+PULL=true
+
+# --- 선택: 대용량 저장소 메모리 튜닝 ---
+# ENV=path/to/app.env        # 앱 env 파일 (--env)
+# WORKERS=4                  # 동시 자식 프로세스 수
+# MAX_OLD_SPACE=12288        # 프로세스당 V8 힙(MB)
+# NO_SPLIT=false             # true 면 분할 끄고 단일 프로세스

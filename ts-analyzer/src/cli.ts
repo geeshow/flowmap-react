@@ -7,6 +7,7 @@
  *   stats   [--graph g.json | --repo <dir>]
  */
 
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { bfs, Direction, findNodes } from './bfs';
@@ -14,9 +15,13 @@ import { GraphBuilder } from './graphBuilder';
 import { join as joinGraphs } from './join';
 import * as jsonOutput from './jsonOutput';
 import { CallGraph } from './model';
+import type { IrFile } from './ir';
 import { TsResolver } from './resolver/irBuilder';
+import { isReactProject, isVueProject } from './resolver/program';
+import { discoverProjectRoots } from './resolver/projectScan';
 import { VueResolver } from './resolver/vue/vueIrBuilder';
 import { buildScreens } from './screens';
+import { ensureHeap, planWorkers, runProjectWorkers } from './workers';
 
 interface Opts {
   flags: Record<string, string>;
@@ -27,8 +32,15 @@ function parseOpts(args: string[]): Opts {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith('--')) {
-      flags[a] = args[i + 1] ?? '';
-      i++;
+      const next = args[i + 1];
+      // A flag whose next token is another flag (or absent) is boolean, e.g.
+      // `--no-split`. This keeps boolean flags from swallowing the next option.
+      if (next === undefined || next.startsWith('--')) {
+        flags[a] = '';
+      } else {
+        flags[a] = next;
+        i++;
+      }
     }
   }
   return { flags };
@@ -46,8 +58,8 @@ function loadEnvFile(path?: string): Record<string, string> {
   return out;
 }
 
-function analyzeRepo(opts: Opts): { graph: CallGraph; fileCount: number; repo: string } {
-  const repo = opts.flags['--repo'] ?? '../.repo';
+/** In-process analysis (single Program per project) — the original path. */
+function analyzeInProcess(repo: string, opts: Opts): IrFile[] {
   const common = {
     repoRoot: repo,
     projectFilter: opts.flags['--project'] ?? null,
@@ -56,14 +68,52 @@ function analyzeRepo(opts: Opts): { graph: CallGraph; fileCount: number; repo: s
   // React and Vue projects are auto-detected per directory; both emit the same IrFile[].
   const reactFiles = new TsResolver().analyze(common);
   const vueFiles = new VueResolver().analyze({ ...common, mode: opts.flags['--mode'] ?? 'development' });
-  const files = [...reactFiles, ...vueFiles];
+  return [...reactFiles, ...vueFiles];
+}
+
+async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: number; repo: string }> {
+  const repo = opts.flags['--repo'] ?? '../.repo';
+  const splitOff = '--no-split' in opts.flags;
+  const requestedWorkers = opts.flags['--workers'] ? parseInt(opts.flags['--workers'], 10) : null;
+
+  // Split a large repo/workspace into per-project-root child processes so each
+  // giant ts.Program's memory is released after its worker exits. Only worth it
+  // when there is more than one root to spread across processes.
+  const roots = splitOff ? [] : discoverProjectRoots(repo, opts.flags['--project'] ?? null);
+  let files: IrFile[];
+  if (roots.length > 1 && (requestedWorkers ?? 2) > 1) {
+    const plan = planWorkers(roots.length, requestedWorkers);
+    files = await runProjectWorkers(roots, plan, {
+      entry: process.argv[1],
+      repoRoot: path.resolve(repo),
+      envFile: opts.flags['--env'] || undefined,
+      mode: opts.flags['--mode'] || undefined,
+    });
+  } else {
+    files = analyzeInProcess(repo, opts);
+  }
   const graph = new GraphBuilder(files).build();
   return { graph, fileCount: files.length, repo };
 }
 
-function graphFromOpts(opts: Opts): CallGraph {
+/** Hidden worker entrypoint: analyze ONE project root and write IrFile[] JSON. */
+function cmdIr(opts: Opts): void {
+  const root = path.resolve(opts.flags['--root'] ?? '.');
+  const repoRoot = path.resolve(opts.flags['--repo'] ?? '../.repo');
+  const common = { repoRoot, projectFilter: null, env: loadEnvFile(opts.flags['--env']) };
+  const files: IrFile[] = [];
+  if (isReactProject(root)) files.push(...new TsResolver().analyzeRoot(root, repoRoot, common));
+  if (isVueProject(root)) {
+    files.push(...new VueResolver().analyzeRoot(root, repoRoot, { ...common, mode: opts.flags['--mode'] ?? 'development' }));
+  }
+  const out = opts.flags['--out'];
+  if (out) fs.writeFileSync(out, JSON.stringify(files));
+  else process.stdout.write(JSON.stringify(files));
+}
+
+async function graphFromOpts(opts: Opts): Promise<CallGraph> {
   if (opts.flags['--graph']) return jsonOutput.read(fs.readFileSync(opts.flags['--graph'], 'utf8'));
-  return analyzeRepo(opts).graph;
+  return (await analyzeRepo(opts)).graph;
 }
 
 function dump(graph: CallGraph, out: string | undefined, meta: Record<string, unknown>): void {
@@ -88,8 +138,8 @@ function refreshManifest(out: string | undefined): void {
   }
 }
 
-function cmdAnalyze(opts: Opts): void {
-  const { graph, fileCount, repo } = analyzeRepo(opts);
+async function cmdAnalyze(opts: Opts): Promise<void> {
+  const { graph, fileCount, repo } = await analyzeRepo(opts);
   dump(graph, opts.flags['--out'], {
     command: 'analyze',
     repo,
@@ -132,13 +182,109 @@ function cmdJoin(opts: Opts): void {
   }
 }
 
-function cmdSearch(opts: Opts): void {
+// ---- pipeline: refresh repo → analyze → screens → join, all from one config ----
+
+/** Default config file searched in cwd when --config is not given. */
+const DEFAULT_CONFIG_FILES = ['flowmap.config', 'flowmap.env', '.flowmaprc'];
+
+/** Parse a KEY=VALUE config file (same format as --env), expanding $VARS. */
+function loadConfig(file: string): Record<string, string> {
+  const raw = loadEnvFile(file);
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    out[k] = v.replace(/\$\{?(\w+)\}?/g, (_m, name) => out[name] ?? process.env[name] ?? raw[name] ?? '');
+  }
+  return out;
+}
+
+function resolveConfigPath(flag?: string): string | null {
+  if (flag) return fs.existsSync(flag) ? flag : null;
+  if (process.env.FLOWMAP_CONFIG && fs.existsSync(process.env.FLOWMAP_CONFIG)) return process.env.FLOWMAP_CONFIG;
+  for (const f of DEFAULT_CONFIG_FILES) if (fs.existsSync(f)) return f;
+  return null;
+}
+
+/** Update the analyzed checkout(s) before analysis (best-effort, fast-forward only). */
+function refreshRepo(repo: string, project: string | null, pull: boolean): void {
+  if (!pull) return;
+  const candidates = [project ? path.join(repo, project) : null, repo].filter(Boolean) as string[];
+  const isGit = (dir: string) =>
+    spawnSync('git', ['-C', dir, 'rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' }).status === 0;
+  const target = candidates.find((d) => fs.existsSync(d) && isGit(d));
+  if (!target) {
+    process.stderr.write(`pull: no git work tree under ${repo} — skipping refresh\n`);
+    return;
+  }
+  process.stderr.write(`pull: git -C ${target} pull --ff-only\n`);
+  const res = spawnSync('git', ['-C', target, 'pull', '--ff-only'], { stdio: 'inherit' });
+  if (res.status !== 0) process.stderr.write(`pull: failed (exit ${res.status}) — continuing with current checkout\n`);
+}
+
+async function cmdPipeline(opts: Opts): Promise<void> {
+  const cfgPath = resolveConfigPath(opts.flags['--config']);
+  const cfg = cfgPath ? loadConfig(cfgPath) : {};
+  if (cfgPath) process.stderr.write(`config: ${cfgPath}\n`);
+
+  // Precedence: CLI flag > config file > default.
+  const pick = (flag: string, key: string, def = ''): string => opts.flags[flag] ?? cfg[key] ?? def;
+
+  const repo = pick('--repo', 'REPO', '../.repo');
+  const project = pick('--project', 'PROJECT') || null;
+  const outDir = pick('--out-dir', 'OUT_DIR', '.');
+  const backend = pick('--backend', 'BACKEND');
+  const mode = pick('--mode', 'MODE');
+  const envFile = pick('--env', 'ENV');
+  const workers = pick('--workers', 'WORKERS');
+  const noSplit = '--no-split' in opts.flags || /^(1|true|yes)$/i.test(cfg.NO_SPLIT ?? '');
+  const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
+
+  fs.mkdirSync(outDir, { recursive: true });
+  // Output file base: explicit NAME, else PROJECT, else "graph" (whole-repo run).
+  const base = pick('--name', 'NAME') || project || 'graph';
+  const graphOut = path.join(outDir, `${base}.json`);
+  const screensOut = path.join(outDir, `${base}.screens.json`);
+  const joinOut = path.join(outDir, `${base}.join.json`);
+
+  // Shared flags passed down to each step.
+  const common: Record<string, string> = { '--repo': repo };
+  if (project) common['--project'] = project;
+  if (mode) common['--mode'] = mode;
+  if (envFile) common['--env'] = envFile;
+  if (workers) common['--workers'] = workers;
+  if (noSplit) common['--no-split'] = '';
+
+  // 0) refresh checkout
+  refreshRepo(path.resolve(repo), project, pull);
+
+  // 1) analyze
+  process.stderr.write(`\n[1/3] analyze → ${graphOut}\n`);
+  await cmdAnalyze({ flags: { ...common, '--out': graphOut } });
+
+  // 2) screens (no --workers/--no-split; screens has its own light path)
+  process.stderr.write(`\n[2/3] screens → ${screensOut}\n`);
+  const screensFlags: Record<string, string> = { '--repo': repo, '--out': screensOut };
+  if (project) screensFlags['--project'] = project;
+  cmdScreens({ flags: screensFlags });
+
+  // 3) join (skipped if no backend graph configured/present)
+  if (!backend) {
+    process.stderr.write(`\n[3/3] join skipped — set BACKEND in config (or --backend) to enable\n`);
+  } else if (!fs.existsSync(backend)) {
+    process.stderr.write(`\n[3/3] join skipped — backend graph not found: ${backend}\n`);
+  } else {
+    process.stderr.write(`\n[3/3] join → ${joinOut}\n`);
+    cmdJoin({ flags: { '--graph': graphOut, '--backend': backend, '--out': joinOut } });
+  }
+  process.stderr.write(`\ndone.\n`);
+}
+
+async function cmdSearch(opts: Opts): Promise<void> {
   const method = opts.flags['--method'];
   if (!method) {
     process.stderr.write('--method required\n');
     process.exit(2);
   }
-  const graph = graphFromOpts(opts);
+  const graph = await graphFromOpts(opts);
   const matches = findNodes(graph, method);
   if (!matches.length) {
     process.stderr.write(`no node matches '${method}'\n`);
@@ -177,8 +323,8 @@ function cmdScreens(opts: Opts): void {
   }
 }
 
-function cmdStats(opts: Opts): void {
-  const graph = graphFromOpts(opts);
+async function cmdStats(opts: Opts): Promise<void> {
+  const graph = await graphFromOpts(opts);
   const layers = countBy(graph.nodes, (n) => n.layer);
   const kinds = countBy(graph.edges, (e) => e.kind);
   const relations = countBy(graph.edges, (e) => e.relation);
@@ -204,7 +350,9 @@ function usage(): void {
   process.stderr.write(
     [
       'flowmap-react (TypeScript Compiler API)',
+      '  pipeline [--config flowmap.config]   # refresh repo → analyze → screens → join, options from config',
       '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--mode development|production]',
+      '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
       '  join    --graph front.json --backend backend.json [--out join.json]',
       '  search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]',
       '  stats   [--graph g.json | --repo <dir>]',
@@ -214,7 +362,7 @@ function usage(): void {
   );
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (!argv.length) {
     usage();
@@ -222,18 +370,37 @@ function main(): void {
   }
   const cmd = argv[0];
   const opts = parseOpts(argv.slice(1));
+
+  // For `pipeline`, let the config file set the heap target before the guard runs.
+  if (cmd === 'pipeline' && !process.env.FLOWMAP_MAX_OLD_SPACE) {
+    const cfgPath = resolveConfigPath(opts.flags['--config']);
+    const mos = cfgPath ? loadConfig(cfgPath).MAX_OLD_SPACE : '';
+    if (mos) process.env.FLOWMAP_MAX_OLD_SPACE = mos;
+  }
+
+  // Workers (`__ir`) inherit a heap flag from the parent; only the user-facing
+  // commands that build a ts.Program in-process need the heap guard.
+  if (['analyze', 'search', 'stats', 'screens', 'pipeline'].includes(cmd)) ensureHeap();
+
   switch (cmd) {
     case 'analyze':
-      cmdAnalyze(opts);
+      await cmdAnalyze(opts);
+      break;
+    case 'pipeline':
+    case 'all':
+      await cmdPipeline(opts);
+      break;
+    case '__ir': // hidden: per-project worker, prints/writes IrFile[]
+      cmdIr(opts);
       break;
     case 'join':
       cmdJoin(opts);
       break;
     case 'search':
-      cmdSearch(opts);
+      await cmdSearch(opts);
       break;
     case 'stats':
-      cmdStats(opts);
+      await cmdStats(opts);
       break;
     case 'screens':
       cmdScreens(opts);
@@ -250,4 +417,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((e) => {
+  process.stderr.write(`${(e as Error).stack ?? e}\n`);
+  process.exit(1);
+});

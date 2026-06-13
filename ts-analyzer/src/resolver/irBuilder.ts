@@ -50,6 +50,11 @@ export class TsResolver implements Resolver {
     return out;
   }
 
+  /** Analyze a single explicit project root (used by the per-project worker). */
+  analyzeRoot(projectRoot: string, repoRoot: string, opts: ResolveOptions): IrFile[] {
+    return this.analyzeProject(path.resolve(projectRoot), path.resolve(repoRoot), opts);
+  }
+
   private analyzeProject(projectRoot: string, repoRoot: string, opts: ResolveOptions): IrFile[] {
     const pp = buildProjectProgram(projectRoot, { repoRoot });
     const ctx = new AnalysisContext(pp.checker, repoRoot, pp.program.getCompilerOptions(), pp.sourceFiles);
