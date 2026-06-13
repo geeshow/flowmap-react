@@ -7,6 +7,7 @@
  *   stats   [--graph g.json | --repo <dir>]
  */
 
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { bfs, Direction, findNodes } from './bfs';
@@ -181,6 +182,101 @@ function cmdJoin(opts: Opts): void {
   }
 }
 
+// ---- pipeline: refresh repo → analyze → screens → join, all from one config ----
+
+/** Default config file searched in cwd when --config is not given. */
+const DEFAULT_CONFIG_FILES = ['flowmap.config', 'flowmap.env', '.flowmaprc'];
+
+/** Parse a KEY=VALUE config file (same format as --env), expanding $VARS. */
+function loadConfig(file: string): Record<string, string> {
+  const raw = loadEnvFile(file);
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    out[k] = v.replace(/\$\{?(\w+)\}?/g, (_m, name) => out[name] ?? process.env[name] ?? raw[name] ?? '');
+  }
+  return out;
+}
+
+function resolveConfigPath(flag?: string): string | null {
+  if (flag) return fs.existsSync(flag) ? flag : null;
+  if (process.env.FLOWMAP_CONFIG && fs.existsSync(process.env.FLOWMAP_CONFIG)) return process.env.FLOWMAP_CONFIG;
+  for (const f of DEFAULT_CONFIG_FILES) if (fs.existsSync(f)) return f;
+  return null;
+}
+
+/** Update the analyzed checkout(s) before analysis (best-effort, fast-forward only). */
+function refreshRepo(repo: string, project: string | null, pull: boolean): void {
+  if (!pull) return;
+  const candidates = [project ? path.join(repo, project) : null, repo].filter(Boolean) as string[];
+  const isGit = (dir: string) =>
+    spawnSync('git', ['-C', dir, 'rev-parse', '--is-inside-work-tree'], { stdio: 'ignore' }).status === 0;
+  const target = candidates.find((d) => fs.existsSync(d) && isGit(d));
+  if (!target) {
+    process.stderr.write(`pull: no git work tree under ${repo} — skipping refresh\n`);
+    return;
+  }
+  process.stderr.write(`pull: git -C ${target} pull --ff-only\n`);
+  const res = spawnSync('git', ['-C', target, 'pull', '--ff-only'], { stdio: 'inherit' });
+  if (res.status !== 0) process.stderr.write(`pull: failed (exit ${res.status}) — continuing with current checkout\n`);
+}
+
+async function cmdPipeline(opts: Opts): Promise<void> {
+  const cfgPath = resolveConfigPath(opts.flags['--config']);
+  const cfg = cfgPath ? loadConfig(cfgPath) : {};
+  if (cfgPath) process.stderr.write(`config: ${cfgPath}\n`);
+
+  // Precedence: CLI flag > config file > default.
+  const pick = (flag: string, key: string, def = ''): string => opts.flags[flag] ?? cfg[key] ?? def;
+
+  const repo = pick('--repo', 'REPO', '../.repo');
+  const project = pick('--project', 'PROJECT') || null;
+  const outDir = pick('--out-dir', 'OUT_DIR', '.');
+  const backend = pick('--backend', 'BACKEND');
+  const mode = pick('--mode', 'MODE');
+  const envFile = pick('--env', 'ENV');
+  const workers = pick('--workers', 'WORKERS');
+  const noSplit = '--no-split' in opts.flags || /^(1|true|yes)$/i.test(cfg.NO_SPLIT ?? '');
+  const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
+
+  fs.mkdirSync(outDir, { recursive: true });
+  const base = project ?? 'graph';
+  const graphOut = path.join(outDir, `${base}.json`);
+  const screensOut = path.join(outDir, `${base}.screens.json`);
+  const joinOut = path.join(outDir, `${base}.join.json`);
+
+  // Shared flags passed down to each step.
+  const common: Record<string, string> = { '--repo': repo };
+  if (project) common['--project'] = project;
+  if (mode) common['--mode'] = mode;
+  if (envFile) common['--env'] = envFile;
+  if (workers) common['--workers'] = workers;
+  if (noSplit) common['--no-split'] = '';
+
+  // 0) refresh checkout
+  refreshRepo(path.resolve(repo), project, pull);
+
+  // 1) analyze
+  process.stderr.write(`\n[1/3] analyze → ${graphOut}\n`);
+  await cmdAnalyze({ flags: { ...common, '--out': graphOut } });
+
+  // 2) screens (no --workers/--no-split; screens has its own light path)
+  process.stderr.write(`\n[2/3] screens → ${screensOut}\n`);
+  const screensFlags: Record<string, string> = { '--repo': repo, '--out': screensOut };
+  if (project) screensFlags['--project'] = project;
+  cmdScreens({ flags: screensFlags });
+
+  // 3) join (skipped if no backend graph configured/present)
+  if (!backend) {
+    process.stderr.write(`\n[3/3] join skipped — set BACKEND in config (or --backend) to enable\n`);
+  } else if (!fs.existsSync(backend)) {
+    process.stderr.write(`\n[3/3] join skipped — backend graph not found: ${backend}\n`);
+  } else {
+    process.stderr.write(`\n[3/3] join → ${joinOut}\n`);
+    cmdJoin({ flags: { '--graph': graphOut, '--backend': backend, '--out': joinOut } });
+  }
+  process.stderr.write(`\ndone.\n`);
+}
+
 async function cmdSearch(opts: Opts): Promise<void> {
   const method = opts.flags['--method'];
   if (!method) {
@@ -253,6 +349,7 @@ function usage(): void {
   process.stderr.write(
     [
       'flowmap-react (TypeScript Compiler API)',
+      '  pipeline [--config flowmap.config]   # refresh repo → analyze → screens → join, options from config',
       '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--mode development|production]',
       '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
       '  join    --graph front.json --backend backend.json [--out join.json]',
@@ -273,13 +370,24 @@ async function main(): Promise<void> {
   const cmd = argv[0];
   const opts = parseOpts(argv.slice(1));
 
+  // For `pipeline`, let the config file set the heap target before the guard runs.
+  if (cmd === 'pipeline' && !process.env.FLOWMAP_MAX_OLD_SPACE) {
+    const cfgPath = resolveConfigPath(opts.flags['--config']);
+    const mos = cfgPath ? loadConfig(cfgPath).MAX_OLD_SPACE : '';
+    if (mos) process.env.FLOWMAP_MAX_OLD_SPACE = mos;
+  }
+
   // Workers (`__ir`) inherit a heap flag from the parent; only the user-facing
   // commands that build a ts.Program in-process need the heap guard.
-  if (cmd === 'analyze' || cmd === 'search' || cmd === 'stats' || cmd === 'screens') ensureHeap();
+  if (['analyze', 'search', 'stats', 'screens', 'pipeline'].includes(cmd)) ensureHeap();
 
   switch (cmd) {
     case 'analyze':
       await cmdAnalyze(opts);
+      break;
+    case 'pipeline':
+    case 'all':
+      await cmdPipeline(opts);
       break;
     case '__ir': // hidden: per-project worker, prints/writes IrFile[]
       cmdIr(opts);

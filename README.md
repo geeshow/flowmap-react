@@ -80,6 +80,32 @@ npm run build            # ts-analyzer 설치 + 빌드
 # npm 스크립트로도 가능: npm run analyze -- --repo .repo --project <P> --out ...
 ```
 
+### 한 번에 실행 — `pipeline` (repo 최신화 → analyze → screens → join)
+
+매번 3개 명령을 치는 대신, 옵션을 **설정파일**에 적어두고 한 번에 실행합니다.
+
+```bash
+cp flowmap.config.example flowmap.config   # 값을 환경에 맞게 수정
+./flowmap pipeline                          # flowmap.config 자동 로드
+# 또는: npm run pipeline / ./flowmap pipeline --config 다른경로.config
+```
+
+설정파일(`flowmap.config`)은 `KEY=VALUE` 형식이며 `${VAR}` 치환을 지원합니다. 출력 파일명은
+`PROJECT` 기준으로 자동 파생됩니다 — `<OUT_DIR>/<PROJECT>.json`, `.screens.json`, `.join.json`.
+
+| 키 | 설명 |
+|---|---|
+| `REPO` | 분석 대상 소스 체크아웃 루트 (`.repo/<project>/`) |
+| `PROJECT` | 분석할 프로젝트(=출력 파일명 베이스); 생략 시 전체 |
+| `OUT_DIR` | 결과 JSON 디렉터리(없으면 생성) |
+| `BACKEND` | 백엔드 결합 그래프(join 입력); 없으면 join 자동 스킵 |
+| `MODE` | Vue/Nuxt env(`development`/`production`) |
+| `PULL` | 분석 전 `git pull --ff-only` 로 체크아웃 최신화 (`true`/`false`) |
+| `WORKERS`, `MAX_OLD_SPACE`, `NO_SPLIT`, `ENV` | (선택) 메모리/동시성 튜닝 |
+
+> 단계별 동작은 위 개별 명령과 동일합니다. `pipeline`도 힙 자동 확장·프로젝트 분할이 그대로 적용됩니다.
+> CLI 플래그(`--repo` 등)를 같이 주면 설정파일 값을 덮어씁니다.
+
 ### 대용량 저장소 / 메모리 (OOM 방지)
 
 수천 개 컴포넌트 규모의 워크스페이스는 단일 `ts.Program`이 Node 기본 힙(~2–4GB)을 넘겨

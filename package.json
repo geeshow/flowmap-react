@@ -6,6 +6,7 @@
   "scripts": {
     "build": "npm --prefix ts-analyzer install --no-audit --no-fund && npm --prefix ts-analyzer run build",
     "flowmap": "node ts-analyzer/dist/cli.js",
+    "pipeline": "node ts-analyzer/dist/cli.js pipeline",
     "analyze": "node ts-analyzer/dist/cli.js analyze",
     "screens": "node ts-analyzer/dist/cli.js screens",
     "join": "node ts-analyzer/dist/cli.js join",

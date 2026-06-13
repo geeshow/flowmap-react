@@ -13,6 +13,11 @@ dist/
 # Analysis outputs (graphs / join / screens JSON)
 /json/*.json
 
+# Local pipeline config (machine-specific paths). The example stays tracked.
+/flowmap.config
+/flowmap.env
+/.flowmaprc
+
 # OS / editor
 .DS_Store
 .idea/
