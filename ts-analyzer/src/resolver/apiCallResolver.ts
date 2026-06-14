@@ -13,7 +13,7 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, SWR_QUERY_MODULES, isComponentName, isHookName } from '../classify';
+import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, HTTP_CLIENT_MODULES, SWR_QUERY_MODULES, isComponentName, isHookName } from '../classify';
 import type { ApiResolution } from '../ir';
 import type { Confidence } from '../model';
 import { normalize } from '../norm';
@@ -89,6 +89,15 @@ export class ApiCallResolver {
       return this.configForm(call, { name: 'axios', baseUrl: null, clientPackage: null });
     }
 
+    // ky(url, {method}) / got(url, {method}) — callable HTTP clients
+    if (ts.isIdentifier(callee)) {
+      const client = this.httpClientName(callee);
+      if (client) {
+        const m = this.methodFromConfig(call.arguments[1]);
+        return { method: m ?? 'GET', verbConfident: m != null, urlExpr: call.arguments[0], service: client, instanceBaseUrl: null, clientPackage: null };
+      }
+    }
+
     // useSWR(key, fetcher) — the key is the request URL (GET). Default-imported,
     // so detect by module ('swr' / 'swr/immutable' / 'swr/infinite'), not name.
     if (ts.isIdentifier(callee)) {
@@ -109,6 +118,11 @@ export class ApiCallResolver {
     if (ts.isPropertyAccessExpression(callee)) {
       const method = callee.name.text;
       const recv = callee.expression;
+      // ky/got/superagent: client.get/post(url) (verb chains like .send() wrap this inner call)
+      const client = this.httpClientName(recv);
+      if (client && AXIOS_VERB_METHODS.has(method)) {
+        return { method: method.toUpperCase(), verbConfident: true, urlExpr: call.arguments[0], service: client, instanceBaseUrl: null, clientPackage: null };
+      }
       const recvIsAxios = this.isAxiosImport(recv);
       const inst = recvIsAxios ? { name: 'axios', baseUrl: null, clientPackage: null } : this.axiosInstanceInfo(recv);
       if (!inst) return null;
@@ -418,13 +432,12 @@ export class ApiCallResolver {
     const out = new Map<string, ApiResolution>();
     for (const sf of sourceFiles) {
       const visit = (node: ts.Node) => {
-        if (
-          ts.isCallExpression(node) &&
-          ts.isIdentifier(node.expression) &&
-          node.expression.text === 'createApi' &&
-          this.isReduxToolkitImport(node.expression)
-        ) {
-          this.parseCreateApi(node, out);
+        if (ts.isCallExpression(node)) {
+          const c = node.expression;
+          // createApi({...}) (with the RTK import) or <api>.injectEndpoints/enhanceEndpoints({...})
+          const isCreate = ts.isIdentifier(c) && c.text === 'createApi' && this.isReduxToolkitImport(c);
+          const isInject = ts.isPropertyAccessExpression(c) && (c.name.text === 'injectEndpoints' || c.name.text === 'enhanceEndpoints');
+          if (isCreate || isInject) this.parseCreateApi(node, out);
         }
         ts.forEachChild(node, visit);
       };
@@ -532,6 +545,13 @@ export class ApiCallResolver {
     return mod != null && AXIOS_MODULES.has(mod);
   }
 
+  /** If `node` is a default import of ky/got/superagent, its module name; else null. */
+  private httpClientName(node: ts.Expression): string | null {
+    if (!ts.isIdentifier(node)) return null;
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node));
+    return mod != null && HTTP_CLIENT_MODULES.has(mod) ? mod : null;
+  }
+
   private importModuleOf(sym: ts.Symbol | undefined): string | null {
     const decl = sym?.declarations?.[0];
     if (!decl) return null;
@@ -545,7 +565,8 @@ export class ApiCallResolver {
   }
 
   private axiosInstanceInfo(node: ts.Expression): InstanceInfo | null {
-    if (!ts.isIdentifier(node)) return null;
+    // an identifier (`const http = axios.create()`) or a member (`this.http`).
+    if (!ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node)) return null;
     let sym = this.checker.getSymbolAtLocation(node);
     if (sym && sym.flags & ts.SymbolFlags.Alias) {
       try {
@@ -569,7 +590,10 @@ export class ApiCallResolver {
         if (baseExpr) baseUrl = this.constEval.evalString(baseExpr);
       }
       info = {
-        name: ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name) ? decl.name.text : null,
+        name:
+          (ts.isVariableDeclaration(decl) || ts.isPropertyDeclaration(decl)) && ts.isIdentifier(decl.name)
+            ? decl.name.text
+            : null,
         baseUrl,
         clientPackage: this.relOf(decl),
       };
@@ -582,7 +606,7 @@ export class ApiCallResolver {
   private axiosCreateInitOf(decl: ts.Node | undefined): ts.CallExpression | null {
     if (!decl) return null;
     let expr: ts.Expression | undefined;
-    if (ts.isVariableDeclaration(decl)) expr = decl.initializer;
+    if (ts.isVariableDeclaration(decl) || ts.isPropertyDeclaration(decl)) expr = decl.initializer;
     else if (ts.isExportAssignment(decl)) expr = decl.expression;
     if (!expr || !ts.isCallExpression(expr)) return null;
     if (

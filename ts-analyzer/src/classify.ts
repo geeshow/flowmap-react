@@ -11,6 +11,9 @@ export const AXIOS_MODULES = new Set(['axios']);
 /** SWR read-hook modules — `useSWR(key, fetcher)` treats `key` as the GET URL. */
 export const SWR_QUERY_MODULES = new Set(['swr', 'swr/immutable', 'swr/infinite']);
 
+/** Other HTTP clients with the same `client.verb(url)` / `client(url, {method})` shape. */
+export const HTTP_CLIENT_MODULES = new Set(['ky', 'got', 'superagent']);
+
 /** HTTP verbs available as axios instance methods. */
 export const AXIOS_VERB_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'head', 'options']);
 

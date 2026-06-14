@@ -29,7 +29,7 @@ import { ConstantEvaluator } from './constantEvaluator';
 import { AnalysisContext } from './context';
 import { EnvResolver } from './envResolver';
 import { buildProjectProgram, discoverProjects, isNextProject, provenance, repoRel } from './program';
-import { findNextRoutes, findReactRouterRoutes } from './routeResolver';
+import { findNextRoutes, findReactRouterRoutes, RouteDataFn } from './routeResolver';
 import { StoreAccumulator, collectStores, emptyAccumulator } from './storeResolver';
 
 interface CompMeta {
@@ -99,9 +99,19 @@ export class TsResolver implements Resolver {
       routesByFile.set(file, [...(routesByFile.get(file) ?? []), ...rs]);
     };
     const nextProject = isNextProject(projectRoot);
+    const dataFns: RouteDataFn[] = [];
     for (const sf of pp.sourceFiles) {
-      addRoutes(sf.fileName, findReactRouterRoutes(sf, ctx));
+      addRoutes(sf.fileName, findReactRouterRoutes(sf, ctx, dataFns));
       if (nextProject) addRoutes(sf.fileName, findNextRoutes(sf, ctx, projectRoot));
+    }
+
+    // D2. react-router v6.4 data routers fetch in loader/action — attribute those
+    // HTTP calls to the screen component the route renders.
+    const compById = new Map(metas.map((m) => [m.comp.id, m]));
+    for (const { screenComponentId, fn } of dataFns) {
+      const screen = screenComponentId ? compById.get(screenComponentId) : undefined;
+      if (!screen) continue;
+      walker.walk({ comp: screen.comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
     }
 
     // assemble IrFile per source file

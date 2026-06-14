@@ -39,6 +39,13 @@ describe('normPath (CrossRun.normPath)', () => {
   it('two id styles collapse to the same key', () => {
     expect(normPath('/users/{id}')).toBe(normPath('/users/{userNo}'));
   });
+
+  it('collapses express/nest :param to {} (both normalizers)', () => {
+    expect(normPath('/files/:id')).toBe('/files/{}');
+    expect(normalize('/files/:fileId')).toBe('/files/{}');
+    // a :param path matches a {} template path
+    expect(normPath('/files/:id')).toBe(normPath('/files/{id}'));
+  });
 });
 
 describe('verbOk (CrossRun.verbOk)', () => {

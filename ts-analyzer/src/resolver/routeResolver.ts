@@ -11,8 +11,15 @@ import { NEXT_NON_SCREEN, ROUTER_FACTORY_FNS, ROUTER_ROUTE_TAGS } from '../class
 import type { IrRoute } from '../ir';
 import { AnalysisContext } from './context';
 
-/** AST-based react-router routes within one source file. */
-export function findReactRouterRoutes(sf: ts.SourceFile, ctx: AnalysisContext): IrRoute[] {
+/** A route's data function (react-router v6.4+ `loader`/`action`) and its screen. */
+export interface RouteDataFn {
+  screenComponentId: string | null;
+  fn: ts.FunctionLikeDeclaration;
+}
+
+/** AST-based react-router routes within one source file. `dataFns`, if given,
+ *  collects route `loader`/`action` functions (their HTTP calls belong to the screen). */
+export function findReactRouterRoutes(sf: ts.SourceFile, ctx: AnalysisContext, dataFns?: RouteDataFn[]): IrRoute[] {
   const routes: IrRoute[] = [];
 
   const visit = (node: ts.Node) => {
@@ -24,17 +31,31 @@ export function findReactRouterRoutes(sf: ts.SourceFile, ctx: AnalysisContext): 
         if (route) routes.push(route);
       }
     }
-    // Object form: createBrowserRouter([...]) / useRoutes([...])
+    // Object form: createBrowserRouter([...]) / useRoutes([...]) — inline array or
+    // an identifier referencing a routes array declared/imported elsewhere.
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && ROUTER_FACTORY_FNS.has(node.expression.text)) {
       const arr = node.arguments[0];
       if (arr && ts.isArrayLiteralExpression(arr)) {
-        collectObjectRoutes(arr, sf, ctx, routes);
+        collectObjectRoutes(arr, sf, ctx, routes, dataFns);
+      } else if (arr && ts.isIdentifier(arr)) {
+        const resolved = resolveRoutesArray(arr, ctx);
+        if (resolved) collectObjectRoutes(resolved, resolved.getSourceFile(), ctx, routes, dataFns);
       }
     }
     ts.forEachChild(node, visit);
   };
   visit(sf);
   return routes;
+}
+
+/** Resolve a `createBrowserRouter(routes)` identifier to its array-literal declaration. */
+function resolveRoutesArray(id: ts.Identifier, ctx: AnalysisContext): ts.ArrayLiteralExpression | null {
+  const sym = ctx.symbolAt(id);
+  const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+  if (decl && ts.isVariableDeclaration(decl) && decl.initializer && ts.isArrayLiteralExpression(decl.initializer)) {
+    return decl.initializer;
+  }
+  return null;
 }
 
 function routeFromJsxAttrs(attrs: ts.JsxAttributes, sf: ts.SourceFile, ctx: AnalysisContext): IrRoute | null {
@@ -74,11 +95,18 @@ function componentFromAttrInitializer(init: ts.JsxAttributeValue, ctx: AnalysisC
   return { id: null, lazy: false };
 }
 
-function collectObjectRoutes(arr: ts.ArrayLiteralExpression, sf: ts.SourceFile, ctx: AnalysisContext, out: IrRoute[]): void {
+function collectObjectRoutes(
+  arr: ts.ArrayLiteralExpression,
+  sf: ts.SourceFile,
+  ctx: AnalysisContext,
+  out: IrRoute[],
+  dataFns?: RouteDataFn[],
+): void {
   for (const el of arr.elements) {
     if (!ts.isObjectLiteralExpression(el)) continue;
     let routePath: string | null = null;
     let comp: { id: string | null; lazy: boolean } | null = null;
+    const routeFns: ts.FunctionLikeDeclaration[] = [];
     for (const p of el.properties) {
       if (!ts.isPropertyAssignment(p)) continue;
       const key = p.name.getText(sf);
@@ -94,10 +122,14 @@ function collectObjectRoutes(arr: ts.ArrayLiteralExpression, sf: ts.SourceFile, 
         comp = ctx.resolveComponentRef(p.initializer);
       }
       if (key === 'lazy') comp = { id: comp?.id ?? null, lazy: true };
+      if ((key === 'loader' || key === 'action') && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer))) {
+        routeFns.push(p.initializer);
+      }
       if (key === 'children' && ts.isArrayLiteralExpression(p.initializer)) {
-        collectObjectRoutes(p.initializer, sf, ctx, out);
+        collectObjectRoutes(p.initializer, sf, ctx, out, dataFns);
       }
     }
+    if (dataFns) for (const fn of routeFns) dataFns.push({ screenComponentId: comp?.id ?? null, fn });
     if (routePath != null || comp?.id) {
       out.push({
         routePath,

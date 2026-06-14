@@ -33,7 +33,8 @@ export function normalize(path: string | null | undefined): string {
     .split('?')[0]
     .split('/')
     .filter((s) => s.length > 0)
-    .map((seg) => (seg.startsWith('{') || looksLikeId(seg) ? '{}' : seg));
+    // `{x}` template var, `:x` express/nest param, or a concrete id → "{}"
+    .map((seg) => (seg.startsWith('{') || seg.startsWith(':') || looksLikeId(seg) ? '{}' : seg));
   return '/' + parts.join('/');
 }
 
@@ -48,7 +49,10 @@ export function normalize(path: string | null | undefined): string {
  */
 export function normPath(p: string | null | undefined): string {
   if (p == null || p === '') return '';
-  let s = p.split('?')[0].replace(/\{[^}]*\}/g, '{}');
+  let s = p
+    .split('?')[0]
+    .replace(/\{[^}]*\}/g, '{}')
+    .replace(/(^|\/):[^/]+/g, '$1{}'); // express/nest `:param` → "{}"
   if (s.length > 1) s = s.replace(/\/+$/, '');
   return s;
 }

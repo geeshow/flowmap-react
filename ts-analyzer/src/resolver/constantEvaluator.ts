@@ -69,6 +69,9 @@ export class ConstantEvaluator {
 
     if (ts.isIdentifier(node)) return this.evalIdentifier(node, depth);
 
+    // new URL(path, base) — join the env-derived base host with the path.
+    if (ts.isNewExpression(node)) return this.evalNewUrl(node, depth);
+
     // Call to a const/path-builder function, e.g. `ORDER_PATHS.DETAIL(id)` or `gwOrderDetail(id)`
     // where the callee is `(id) => `/v1/orders/${id}``. Evaluate the function's returned string;
     // its parameters are runtime values → fold to "{}" (matches a backend path param).
@@ -77,8 +80,46 @@ export class ConstantEvaluator {
     return NONE;
   }
 
+  /** `new URL(path, base)` → base host joined with path (both folded). */
+  private evalNewUrl(node: ts.NewExpression, depth: number): EvalString {
+    if (!ts.isIdentifier(node.expression) || node.expression.text !== 'URL') return NONE;
+    const args = node.arguments ?? ([] as unknown as ts.NodeArray<ts.Expression>);
+    const p = this.evalString(args[0], depth + 1);
+    const b = args[1] ? this.evalString(args[1], depth + 1) : NONE;
+    if (b.value != null && /:\/\//.test(b.value)) {
+      const base = b.value.replace(/\/+$/, '');
+      const rel = p.value ?? '';
+      const joined = rel === '' ? base : rel.startsWith('/') ? base + rel : base + '/' + rel;
+      return { value: joined, hasPlaceholder: b.hasPlaceholder || p.hasPlaceholder };
+    }
+    return p.value != null ? p : NONE;
+  }
+
   /** Evaluate a call to a project-local string-returning function (path-builder const). */
   private evalCall(node: ts.CallExpression, depth: number): EvalString {
+    // String methods on a resolvable receiver: `'/users/:id'.replace(':id', x)`,
+    // `new URL(p, base).toString()`.
+    const callee = node.expression;
+    if (ts.isPropertyAccessExpression(callee)) {
+      const m = callee.name.text;
+      if (m === 'toString' || m === 'toJSON') {
+        return ts.isNewExpression(callee.expression)
+          ? this.evalNewUrl(callee.expression, depth)
+          : this.evalString(callee.expression, depth + 1);
+      }
+      if (m === 'replace' && node.arguments[0] && ts.isStringLiteralLike(node.arguments[0])) {
+        const recv = this.evalString(callee.expression, depth + 1);
+        if (recv.value != null) {
+          const pat = node.arguments[0].text;
+          const rep = this.evalString(node.arguments[1], depth + 1);
+          const repVal = rep.value != null ? rep.value : '{}'; // runtime replacement → "{}"
+          return {
+            value: recv.value.split(pat).join(repVal),
+            hasPlaceholder: recv.hasPlaceholder || rep.value == null || rep.hasPlaceholder,
+          };
+        }
+      }
+    }
     const ret = this.returnExprOf(node.expression);
     if (!ret) return NONE;
     return this.evalString(ret, depth + 1);
@@ -186,14 +227,16 @@ export class ConstantEvaluator {
     return { value: out, hasPlaceholder };
   }
 
+  /** Env var value as an EvalString — its value if known, else a `${NAME}` placeholder. */
+  private envValue(name: string): EvalString {
+    const v = this.env.lookup(name);
+    return v != null ? this.classify(v) : { value: '${' + name + '}', hasPlaceholder: true };
+  }
+
   private evalAccess(node: ts.PropertyAccessExpression | ts.ElementAccessExpression, depth: number): EvalString {
-    // import.meta.env.X  /  process.env.X
+    // import.meta.env.X  /  process.env.X (incl. aliases: const E = import.meta.env)
     const envName = this.envVarName(node);
-    if (envName != null) {
-      const v = this.env.lookup(envName);
-      if (v != null) return this.classify(v);
-      return { value: '${' + envName + '}', hasPlaceholder: true };
-    }
+    if (envName != null) return this.envValue(envName);
     // config.member → resolve the property's initializer
     if (ts.isPropertyAccessExpression(node)) {
       const sym = this.symbolAt(node);
@@ -228,6 +271,8 @@ export class ConstantEvaluator {
     // Only local destructures are constant; a destructured parameter is a runtime value.
     const owner = pattern.parent;
     if (ts.isVariableDeclaration(owner) && owner.initializer) {
+      // const { VITE_API_GW } = import.meta.env
+      if (this.isEnvNamespace(owner.initializer)) return this.envValue(key);
       return this.evalPropertyOf(owner.initializer, key, depth);
     }
     return NONE;
@@ -269,18 +314,24 @@ export class ConstantEvaluator {
         ? node.argumentExpression.text
         : null;
     if (!name) return null;
-    const owner = node.expression;
-    // owner must be `import.meta.env` or `process.env`
-    if (ts.isPropertyAccessExpression(owner)) {
-      if (owner.name.text === 'env') {
-        const base = owner.expression;
-        // import.meta.env
-        if (ts.isMetaProperty(base) && base.keywordToken === ts.SyntaxKind.ImportKeyword) return name;
-        // process.env
-        if (ts.isIdentifier(base) && base.text === 'process') return name;
-      }
+    // owner is `import.meta.env` / `process.env`, or a variable aliasing one.
+    return this.isEnvNamespace(node.expression) ? name : null;
+  }
+
+  /** `import.meta.env` / `process.env`, or an identifier whose initializer is one. */
+  private isEnvNamespace(expr: ts.Expression, depth = 0): boolean {
+    if (depth > 8) return false;
+    if (ts.isParenthesizedExpression(expr)) return this.isEnvNamespace(expr.expression, depth + 1);
+    if (ts.isPropertyAccessExpression(expr) && expr.name.text === 'env') {
+      const base = expr.expression;
+      if (ts.isMetaProperty(base) && base.keywordToken === ts.SyntaxKind.ImportKeyword) return true; // import.meta.env
+      if (ts.isIdentifier(base) && base.text === 'process') return true; // process.env
     }
-    return null;
+    if (ts.isIdentifier(expr)) {
+      const init = this.initializerOfSymbol(this.symbolAt(expr));
+      if (init) return this.isEnvNamespace(init, depth + 1); // const E = import.meta.env
+    }
+    return false;
   }
 
   private symbolAt(node: ts.Node): ts.Symbol | undefined {
