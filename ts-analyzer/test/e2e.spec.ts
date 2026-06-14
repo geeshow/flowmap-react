@@ -64,10 +64,12 @@ describe('e2e on sample-shop-react', () => {
     expect(list!.externalUrl).toBe('https://api.shop.com/account/v1/account-list');
   });
 
-  it('resolves a queryFn whose axios instance is factory-produced (homeAxios pattern)', () => {
+  it('resolves a queryFn whose axios instance is env-gated/cross-module (homeAxios pattern)', () => {
     // useHomeAccountListSuspenseQuery → accountListQueryOptions → object literal whose
-    // queryFn calls `homeAxios.get(...).then(...)`, where homeAxios = createHomeInstance()
-    // (a factory call, not a direct `axios.create(...)` initializer).
+    // queryFn calls `homeAxios.get(...).then(...)`, where homeAxios is NOT a direct
+    // `axios.create(...)`: it's `isServer ? serverAxios : secAxios`, and secAxios's own
+    // module default-export is itself `isMock ? mockAxios : secAxios` over an
+    // `axios.create({...})` — so instance detection must follow ternaries + cross-file aliases.
     const list = httpNodes.find((n) => n.endpoint === '/account/v1/account-list');
     expect(list).toBeTruthy();
     const hook = byId('sample-shop-react/src/api/homeQuery.ts::useHomeAccountListSuspenseQuery');
