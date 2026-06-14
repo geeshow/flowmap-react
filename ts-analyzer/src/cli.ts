@@ -194,14 +194,15 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
     edges: combined.edges.length,
     services: services.map((s) => s.name),
   });
-  // Each project root → its own `<service>.json` (a distinct service), so the
-  // _manifest.json catalogues them individually. Combined graph stays as `--out`.
+  // Each project root → its own `<name>-<service>.json` (a distinct service),
+  // so the _manifest.json catalogues them individually. The `<name>` prefix is
+  // the combined-graph base (config NAME), which keeps per-root files grouped
+  // and never collides with the combined graph at `--out`.
   if (out && services.length > 1) {
     const dir = path.dirname(out) || '.';
     const combinedBase = path.basename(out, '.json');
     for (const s of services) {
-      if (s.name === combinedBase) continue; // never clobber the combined graph
-      dump(s.graph, path.join(dir, `${s.name}.json`), {
+      dump(s.graph, path.join(dir, `${combinedBase}-${s.name}.json`), {
         command: 'analyze',
         repo,
         project: s.name,
