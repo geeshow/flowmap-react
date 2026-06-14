@@ -297,6 +297,7 @@ class BodyWalker {
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
         const usage = this.jsxUsage(node, sf);
         if (usage) m.comp.jsxUsages.push(usage);
+        else for (const u of this.dynamicTagUsages(node, sf)) m.comp.jsxUsages.push(u);
         this.collectServerActions(node, m.comp);
       }
 
@@ -347,6 +348,63 @@ class BodyWalker {
     if (ts.isFunctionDeclaration(decl) && decl.body) return decl;
     if (ts.isVariableDeclaration(decl) && decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
       return decl.initializer;
+    }
+    return null;
+  }
+
+  /**
+   * Dynamic component render `arr.map((it) => <it.Comp/>)`: resolve the receiver
+   * `it` to a `.map` callback parameter, find the mapped array literal, and emit a
+   * render usage for each element's component-valued property. Covers the common
+   * data-driven widget-list pattern that a static `<Tag/>` walk misses.
+   */
+  private dynamicTagUsages(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, sf: ts.SourceFile): IrJsxUsage[] {
+    const tag = node.tagName;
+    if (!ts.isPropertyAccessExpression(tag) || !ts.isIdentifier(tag.expression)) return [];
+    if (!isComponentName(tag.name.text)) return []; // last segment must look like a component
+    const propName = tag.name.text;
+
+    const sym = this.ctx.symbolAt(tag.expression);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isParameter(decl)) return [];
+    const fn = decl.parent;
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return [];
+    const mapCall = fn.parent;
+    if (!ts.isCallExpression(mapCall) || !ts.isPropertyAccessExpression(mapCall.expression) || mapCall.expression.name.text !== 'map') {
+      return [];
+    }
+    const arr = this.resolveArrayLiteral(mapCall.expression.expression);
+    if (!arr) return [];
+
+    const line = lineOf(sf, node);
+    const seen = new Set<string>();
+    const out: IrJsxUsage[] = [];
+    for (const el of arr.elements) {
+      if (!ts.isObjectLiteralExpression(el)) continue;
+      for (const p of el.properties) {
+        let val: ts.Expression | undefined;
+        if (ts.isPropertyAssignment(p) && p.name.getText(sf) === propName) val = p.initializer;
+        else if (ts.isShorthandPropertyAssignment(p) && p.name.text === propName) val = p.name;
+        if (!val) continue;
+        const r = this.ctx.resolveComponentRef(val);
+        if (r.id && !seen.has(r.id)) {
+          seen.add(r.id);
+          out.push({ tagName: `${tag.expression.getText(sf)}.${propName}`, targetComponentId: r.id, lazy: r.lazy, line });
+        }
+      }
+    }
+    return out;
+  }
+
+  /** An array-literal expression directly, or via a variable that holds one. */
+  private resolveArrayLiteral(expr: ts.Expression): ts.ArrayLiteralExpression | null {
+    if (ts.isArrayLiteralExpression(expr)) return expr;
+    if (ts.isIdentifier(expr)) {
+      const sym = this.ctx.symbolAt(expr);
+      const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+      if (decl && ts.isVariableDeclaration(decl) && decl.initializer && ts.isArrayLiteralExpression(decl.initializer)) {
+        return decl.initializer;
+      }
     }
     return null;
   }
@@ -507,7 +565,14 @@ function declNameNode(decl: ts.Node): ts.Node | null {
 }
 
 function bodyOf(owner: ts.Node): ts.Node | undefined {
-  if (ts.isFunctionDeclaration(owner) || ts.isFunctionExpression(owner) || ts.isArrowFunction(owner)) return owner.body;
+  if (
+    ts.isFunctionDeclaration(owner) ||
+    ts.isFunctionExpression(owner) ||
+    ts.isArrowFunction(owner) ||
+    ts.isMethodDeclaration(owner)
+  ) {
+    return owner.body;
+  }
   if (ts.isClassDeclaration(owner)) return owner;
   return undefined;
 }
