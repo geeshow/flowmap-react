@@ -69,6 +69,12 @@ export const RECOIL_HOOKS = new Set([
   'useRecoilStateLoadable',
 ]);
 
+/** XState: createMachine + fromPromise/fromCallback actors + useMachine/useActor hooks. */
+export const XSTATE_MODULES = new Set(['xstate']);
+export const XSTATE_REACT_MODULES = new Set(['@xstate/react']);
+export const XSTATE_HOOKS = new Set(['useMachine', 'useActor', 'useActorRef']);
+export const XSTATE_ACTOR_FNS = new Set(['fromPromise', 'fromCallback', 'fromObservable', 'fromEventObservable']);
+
 /** Redux store hooks. */
 export const REDUX_HOOKS = new Set(['useSelector', 'useDispatch', 'useStore']);
 

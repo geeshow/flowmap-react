@@ -12,7 +12,17 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { JOTAI_HOOKS, RECOIL_HOOKS, REDUX_HOOKS, isComponentName, isHookName } from '../classify';
+import {
+  JOTAI_HOOKS,
+  RECOIL_HOOKS,
+  REDUX_HOOKS,
+  XSTATE_ACTOR_FNS,
+  XSTATE_HOOKS,
+  XSTATE_MODULES,
+  XSTATE_REACT_MODULES,
+  isComponentName,
+  isHookName,
+} from '../classify';
 import type {
   ComponentKind,
   IrCall,
@@ -125,6 +135,19 @@ export class TsResolver implements Resolver {
       walker.walk({ comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
     }
 
+    // D2c. XState: a component using useMachine(orderMachine) inherits the machine's
+    //      actor (fromPromise/...) HTTP calls — walk those actor bodies into the component.
+    const machineActors = this.buildMachineActors(pp.sourceFiles, ctx);
+    const walkedMachines = new Set<string>();
+    for (const { comp, machineSym } of walker.machineRefs) {
+      for (const fn of machineActors.get(machineSym) ?? []) {
+        const key = `${comp.id}::${fn.getSourceFile().fileName}:${fn.pos}`;
+        if (walkedMachines.has(key)) continue;
+        walkedMachines.add(key);
+        walker.walk({ comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
+      }
+    }
+
     // D3. Next.js route handlers (app/**/route.ts GET/POST..., pages/api default).
     //     Retag them as provider endpoints whose id is the consumer's `ext:<M> <path>`
     //     so the in-repo chain consumer → /api/foo → handler → upstream connects.
@@ -157,6 +180,38 @@ export class TsResolver implements Resolver {
       c.providerMethod = method;
       c.id = `ext:${method ?? 'ANY'} ${ep}`;
     }
+  }
+
+  /**
+   * Map each `const m = createMachine({...})` (xstate) symbol to the actor functions
+   * inside its config — `fromPromise(fn)` / `fromCallback(fn)` etc. Their HTTP calls
+   * are attributed to any component that uses the machine via useMachine/useActor.
+   */
+  private buildMachineActors(sourceFiles: ts.SourceFile[], ctx: AnalysisContext): Map<ts.Symbol, ts.FunctionLikeDeclaration[]> {
+    const out = new Map<ts.Symbol, ts.FunctionLikeDeclaration[]>();
+    for (const sf of sourceFiles) {
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isVariableDeclaration(node) &&
+          ts.isIdentifier(node.name) &&
+          node.initializer &&
+          ts.isCallExpression(node.initializer) &&
+          ts.isIdentifier(node.initializer.expression) &&
+          node.initializer.expression.text === 'createMachine' &&
+          isFromModule(ctx.importModuleOf(node.initializer.expression), XSTATE_MODULES)
+        ) {
+          const sym = ctx.symbolAt(node.name);
+          if (sym) {
+            const fns: ts.FunctionLikeDeclaration[] = [];
+            collectActorFns(node.initializer, fns);
+            if (fns.length) out.set(sym, fns);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return out;
   }
 
   private assembleFiles(
@@ -275,6 +330,8 @@ class BodyWalker {
   /** `<form action={serverAction}>` references discovered during the walk; their
    *  bodies are walked afterward, attributed to the referencing component. */
   readonly serverActionRefs: { comp: IrComponent; fn: ts.FunctionLikeDeclaration }[] = [];
+  /** `useMachine(machine)` references — the machine's actor bodies are walked later. */
+  readonly machineRefs: { comp: IrComponent; machineSym: ts.Symbol }[] = [];
 
   constructor(
     private readonly ctx: AnalysisContext,
@@ -310,6 +367,7 @@ class BodyWalker {
       if (ts.isCallExpression(node)) {
         const call = this.resolveCall(node, asyncDepth > 0, dispatchers, sf);
         if (call) m.comp.calls.push(call);
+        this.collectMachineRef(node, m.comp);
       }
 
       // realtime: new WebSocket(url) / new EventSource(url)
@@ -349,6 +407,17 @@ class BodyWalker {
       if (!ts.isIdentifier(ref)) continue;
       const fn = this.fnDeclOf(ref);
       if (fn && isServerAction(fn)) this.serverActionRefs.push({ comp, fn });
+    }
+  }
+
+  /** `useMachine(orderMachine)` / `useActor(...)` (@xstate/react) — record the machine. */
+  private collectMachineRef(node: ts.CallExpression, comp: IrComponent): void {
+    if (!ts.isIdentifier(node.expression) || !XSTATE_HOOKS.has(node.expression.text)) return;
+    if (!isFromModule(this.ctx.importModuleOf(node.expression), XSTATE_REACT_MODULES)) return;
+    const arg = node.arguments[0];
+    if (arg && ts.isIdentifier(arg)) {
+      const machineSym = this.ctx.symbolAt(arg);
+      if (machineSym) this.machineRefs.push({ comp, machineSym });
     }
   }
 
@@ -636,6 +705,23 @@ function bodyOf(owner: ts.Node): ts.Node | undefined {
 
 function isAsyncFn(node: ts.Node): boolean {
   return !!(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword));
+}
+
+function isFromModule(mod: string | null, set: Set<string>): boolean {
+  return mod != null && set.has(mod);
+}
+
+/** Collect XState actor functions (`fromPromise(fn)` / `fromCallback(fn)` …) inside
+ *  a createMachine config. */
+function collectActorFns(root: ts.Node, out: ts.FunctionLikeDeclaration[]): void {
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && XSTATE_ACTOR_FNS.has(node.expression.text)) {
+      const fn = node.arguments[0];
+      if (fn && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) out.push(fn);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(root);
 }
 
 /** Component-wrapping HOCs whose inline-function argument is still a component body

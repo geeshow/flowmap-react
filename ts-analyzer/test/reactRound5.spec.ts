@@ -123,3 +123,21 @@ describe('advanced routers + composition', () => {
     expect(graph.edges.some((e) => e.source.endsWith('OrdersPage') && e.target === 'ext:GET /api/orders')).toBe(true);
   });
 });
+
+describe('XState machine actors', () => {
+  let dir: string;
+  let graph: CallGraph;
+  beforeAll(() => {
+    ({ dir, graph } = analyze((file) => {
+      file('package.json', JSON.stringify({ dependencies: { react: '^18', 'react-router-dom': '^6', xstate: '^5', '@xstate/react': '^4' } }));
+      file('src/machines/orderMachine.ts', `import { createMachine, fromPromise } from 'xstate';\nexport const orderMachine = createMachine({\n  initial: 'idle',\n  states: { loading: { invoke: { src: fromPromise(async () => { const res = await fetch('/api/xstate/orders'); return res.json(); }) } } },\n});\n`);
+      file('src/pages/XStatePage.tsx', `import { useMachine } from '@xstate/react';\nimport { orderMachine } from '../machines/orderMachine';\nexport default function XStatePage() { const [state] = useMachine(orderMachine); return <div>{String(state)}</div>; }\n`);
+      file('src/main.tsx', `import { createBrowserRouter } from 'react-router-dom';\nimport XStatePage from './pages/XStatePage';\nexport const router = createBrowserRouter([{ path: '/xstate', element: <XStatePage /> }]);\n`);
+    }));
+  });
+  afterAll(() => cleanup(dir));
+
+  it('attributes a fromPromise actor fetch to the component using the machine', () => {
+    expect(graph.edges.some((e) => e.source.endsWith('XStatePage') && e.target === 'ext:GET /api/xstate/orders' && e.relation === 'http')).toBe(true);
+  });
+});
