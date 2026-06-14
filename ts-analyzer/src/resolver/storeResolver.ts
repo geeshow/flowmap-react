@@ -15,7 +15,7 @@ import {
   REDUX_SLICE_FN,
   ZUSTAND_CREATE_FNS,
 } from '../classify';
-import type { IrStore } from '../ir';
+import type { IrComponent, IrStore } from '../ir';
 import { AnalysisContext } from './context';
 
 export interface StoreBindings {
@@ -27,15 +27,24 @@ export interface StoreBindings {
   sliceVarSymbol: Map<ts.Symbol, string>;
 }
 
+/** A createAsyncThunk whose payload-creator body must be walked (so thunk → API edges form). */
+export interface ThunkMeta {
+  comp: IrComponent; // kind: 'action' STORE-layer node
+  bodyOwner: ts.Node; // the payload-creator arrow/function expression
+  file: ts.SourceFile;
+}
+
 export interface StoreAccumulator {
   stores: IrStore[];
   bindings: StoreBindings;
+  thunks: ThunkMeta[];
 }
 
 export function emptyAccumulator(): StoreAccumulator {
   return {
     stores: [],
     bindings: { bySymbol: new Map(), reduxByKey: new Map(), sliceVarSymbol: new Map() },
+    thunks: [],
   };
 }
 
@@ -53,7 +62,7 @@ export function collectStores(sf: ts.SourceFile, ctx: AnalysisContext, acc: Stor
       if (head.name === REDUX_SLICE_FN && isFrom(mod, '@reduxjs/toolkit')) {
         handleSlice(decl, init, varName, ctx, acc, sf);
       } else if (head.name === REDUX_ASYNC_THUNK_FN && isFrom(mod, '@reduxjs/toolkit')) {
-        handleThunk(decl, init, ctx, acc);
+        handleThunk(decl, init, varName, ctx, acc, sf);
       } else if (ZUSTAND_CREATE_FNS.has(head.name) && isFrom(mod, 'zustand')) {
         handleZustand(decl, init, varName, ctx, acc, sf);
       } else if (head.name === CONTEXT_CREATE_FN && isFrom(mod, 'react')) {
@@ -92,14 +101,55 @@ function handleSlice(
   if (sym) acc.bindings.sliceVarSymbol.set(sym, storeId);
 }
 
-function handleThunk(decl: ts.VariableDeclaration, init: ts.Expression, ctx: AnalysisContext, acc: StoreAccumulator): void {
-  // createAsyncThunk('user/fetchUser', ...) → slice key is the prefix before '/'
+function handleThunk(
+  decl: ts.VariableDeclaration,
+  init: ts.Expression,
+  varName: string,
+  ctx: AnalysisContext,
+  acc: StoreAccumulator,
+  sf: ts.SourceFile,
+): void {
+  // createAsyncThunk('user/fetchUser', payloadCreator) → slice key is the prefix before '/'.
   const typeArg = firstStringArg(init);
   if (!typeArg) return;
   const prefix = typeArg.split('/')[0];
-  const storeId = `store:redux:${prefix}`;
   const sym = ctx.symbolAt(decl.name);
-  if (sym) acc.bindings.bySymbol.set(sym, storeId);
+
+  // The thunk becomes its own STORE-layer "action" node whose body is walked, so the
+  // page → dispatch → thunk → apiWrapper → request → http chain is traceable (the
+  // redux analog of a Vuex action). `dispatch(thunk(...))` targets this node.
+  const payload = thunkPayloadCreator(init);
+  if (payload) {
+    const nodeId = `store:redux:${prefix}#${varName}`;
+    const comp: IrComponent = {
+      id: nodeId,
+      name: varName,
+      kind: 'action',
+      exported: true,
+      isAsync: isAsyncNode(payload),
+      line: lineOf(sf, decl),
+      jsxUsages: [],
+      calls: [],
+    };
+    acc.thunks.push({ comp, bodyOwner: payload, file: sf });
+    if (sym) acc.bindings.bySymbol.set(sym, nodeId);
+    return;
+  }
+
+  // No traceable payload creator — fall back to binding the thunk to its slice module.
+  if (sym) acc.bindings.bySymbol.set(sym, `store:redux:${prefix}`);
+}
+
+/** The payload-creator function (2nd arg) of `createAsyncThunk(type, fn, options?)`. */
+function thunkPayloadCreator(init: ts.Expression): ts.Node | null {
+  if (!ts.isCallExpression(init)) return null;
+  const fn = init.arguments[1];
+  if (fn && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) return fn;
+  return null;
+}
+
+function isAsyncNode(node: ts.Node): boolean {
+  return !!(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword));
 }
 
 function handleZustand(

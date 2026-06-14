@@ -43,8 +43,15 @@ export class GraphBuilder {
   build(): CallGraph {
     // 1) component / hook / screen nodes
     for (const { comp, file } of this.compById.values()) this.addNode(this.componentNode(comp, file));
-    // 2) store nodes
-    for (const { store, file } of this.storeById.values()) this.addNode(this.storeNode(store, file));
+    // 2) store nodes (+ container→action edges so a slice/module is linked to the actions it defines)
+    for (const { store, file } of this.storeById.values()) {
+      this.addNode(this.storeNode(store, file));
+      // 액션 노드(store:<kind>:<ns>#<action>)는 별도 컴포넌트로 생성되므로 id 프리픽스로 컨테이너에 연결
+      const prefix = `${store.storeId}#`;
+      for (const id of this.compById.keys()) {
+        if (id.startsWith(prefix)) this.emit(store.storeId, id, 'sync', 'internal', 'store:action', file.path, store.line);
+      }
+    }
     // 3) edges (render / call / http / store) and pulled-in API/EXTERNAL nodes
     for (const f of this.files) {
       for (const c of f.components) {

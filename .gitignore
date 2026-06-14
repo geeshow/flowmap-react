@@ -9,6 +9,7 @@ dist/
 /.repo/*
 !/.repo/sample-shop-react/
 !/.repo/sample-shop-nuxt/
+!/.repo/shopflow-web/
 
 # Analysis outputs (graphs / join / screens JSON)
 /json/*.json

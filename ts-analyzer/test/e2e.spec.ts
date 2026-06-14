@@ -45,6 +45,32 @@ describe('e2e on sample-shop-react', () => {
     expect(eps).toContain('GET /internal/investment/current-summary');
   });
 
+  it('resolves a 2-level custom wrapper with a config-object URL (fetchData pattern)', () => {
+    // component → fetchAccountOpenable → fetchData({ url }) → http.get(url)
+    // URL is NIFFLER_API_URL.ACCOUNT_OPENABLE (object member over nested template literals).
+    const acct = httpNodes.find((n) => n.endpoint === '/account/v1/account-openable');
+    expect(acct).toBeTruthy();
+    expect(acct!.httpMethod).toBe('GET');
+    expect(acct!.externalUrl).toBe('https://api.shop.com/account/v1/account-openable');
+    expect(acct!.confidence).toBe('resolved');
+  });
+
+  it('resolves a React-Query options factory (queryFn + stringifyUrl + default-export axios)', () => {
+    // useAccountListQuery → accountListQueryOptions → queryOptions({ queryFn: () => accountAxios.get(url) })
+    // url = queryString.stringifyUrl({ url: NIFFLER_API_URL.ACCOUNT_LIST, query }) (local const).
+    const list = httpNodes.find((n) => n.endpoint === '/account/v1/account-list');
+    expect(list).toBeTruthy();
+    expect(list!.httpMethod).toBe('GET');
+    expect(list!.externalUrl).toBe('https://api.shop.com/account/v1/account-list');
+  });
+
+  it('resolves a URL pulled from a local object destructure (const { url } = config)', () => {
+    const terms = httpNodes.find((n) => n.endpoint === '/account/v1/service-terms');
+    expect(terms).toBeTruthy();
+    expect(terms!.httpMethod).toBe('GET');
+    expect(terms!.externalUrl).toBe('https://api.shop.com/account/v1/service-terms');
+  });
+
   it('marks a bare fetch as partial (verb defaulted)', () => {
     const f = httpNodes.find((n) => n.endpoint === '/orders' && n.layer === 'API');
     expect(f).toBeTruthy();
@@ -95,5 +121,57 @@ describe('e2e on sample-shop-react', () => {
     expect(byPath['POST /orders'].matchStatus).toBe('ambiguous');
     expect(byPath['GET /maps/api/geocode/json'].matchStatus).toBe('unmatched');
     expect(r.meta.matched).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('e2e on shopflow-web (deep var/const/substituted chains)', () => {
+  const files = new TsResolver().analyze({ repoRoot: REPO, projectFilter: 'shopflow-web' });
+  const g = new GraphBuilder(files).build();
+  const httpNodes = g.nodes.filter((n) => n.layer === 'API' || n.layer === 'EXTERNAL');
+  const ep = (method: string, endpoint: string) =>
+    httpNodes.find((n) => n.httpMethod === method && n.endpoint === endpoint);
+
+  it('resolves every gateway endpoint to its normalized form with confidence=resolved', () => {
+    const expected: Array<[string, string]> = [
+      ['POST', '/user/v1/users'],
+      ['GET', '/user/v1/users/{}/profile'],
+      ['POST', '/order/v1/orders'],
+      ['GET', '/order/v1/orders'],
+      ['GET', '/order/v1/orders/{}'],
+      ['POST', '/payment/v1/payments'],
+      ['GET', '/payment/v1/payments/{}'],
+      ['GET', '/catalog/v1/catalog/items'],
+      ['GET', '/catalog/v1/catalog/items/{}'],
+    ];
+    for (const [m, e] of expected) {
+      const n = ep(m, e);
+      expect(n, `${m} ${e}`).toBeTruthy();
+      expect(n!.confidence, `${m} ${e} confidence`).toBe('resolved');
+      expect(n!.urlPlaceholder, `${m} ${e} placeholder`).toBeFalsy();
+    }
+  });
+
+  it('binds the HTTP verb through a generic request({ url, method }) wrapper', () => {
+    // createUser → request({ url, method: 'POST' }) → http.request(cfg) reads cfg.method.
+    expect(ep('POST', '/user/v1/users')).toBeTruthy();
+  });
+
+  it('folds a function-valued path const call, e.g. (id) => `/v1/orders/${id}` → /{}', () => {
+    expect(ep('GET', '/order/v1/orders/{}')).toBeTruthy();
+    expect(ep('GET', '/catalog/v1/catalog/items/{}')).toBeTruthy();
+  });
+
+  it('resolves a substituted-variable URL indirection (const path = ORDER_PATHS.LIST)', () => {
+    const list = ep('GET', '/order/v1/orders');
+    expect(list).toBeTruthy();
+    expect(list!.externalUrl).toBe('https://gw.shopflow.io/order/v1/orders');
+  });
+
+  it('traces a redux createAsyncThunk body to its API (dispatch → thunk → apiWrapper → http)', () => {
+    const thunk = g.nodes.find((n) => n.id === 'store:redux:order#placeOrder');
+    expect(thunk).toBeTruthy();
+    const fromThunk = g.edges.filter((e) => e.source === thunk!.id && e.target.startsWith('ext:'));
+    expect(fromThunk.length).toBeGreaterThan(0);
+    expect(fromThunk[0].target).toContain('/order/v1/orders');
   });
 });

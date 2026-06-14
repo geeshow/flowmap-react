@@ -55,7 +55,52 @@ export class ConstantEvaluator {
 
     if (ts.isIdentifier(node)) return this.evalIdentifier(node, depth);
 
+    // Call to a const/path-builder function, e.g. `ORDER_PATHS.DETAIL(id)` or `gwOrderDetail(id)`
+    // where the callee is `(id) => `/v1/orders/${id}``. Evaluate the function's returned string;
+    // its parameters are runtime values → fold to "{}" (matches a backend path param).
+    if (ts.isCallExpression(node)) return this.evalCall(node, depth);
+
     return NONE;
+  }
+
+  /** Evaluate a call to a project-local string-returning function (path-builder const). */
+  private evalCall(node: ts.CallExpression, depth: number): EvalString {
+    const ret = this.returnExprOf(node.expression);
+    if (!ret) return NONE;
+    return this.evalString(ret, depth + 1);
+  }
+
+  /** The single returned expression of the function backing a callee, or null. */
+  private returnExprOf(callee: ts.Expression): ts.Expression | null {
+    const fn = this.functionOfExpr(callee);
+    if (!fn) return null;
+    const body = fn.body;
+    if (!body) return null;
+    // arrow with an expression body: `(id) => `...``
+    if (!ts.isBlock(body)) return body as ts.Expression;
+    // block body: first `return <expr>;`
+    let found: ts.Expression | null = null;
+    const visit = (n: ts.Node) => {
+      if (found) return;
+      if (ts.isReturnStatement(n) && n.expression) {
+        found = n.expression;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(body, visit);
+    return found;
+  }
+
+  /** Resolve a callee expression to its arrow/function declaration (following consts/members). */
+  private functionOfExpr(callee: ts.Expression): ts.FunctionLikeDeclaration | null {
+    const sym = this.symbolAt(callee);
+    let init = this.initializerOfSymbol(sym);
+    if (init && ts.isIdentifier(init)) init = this.initializerOf(init) ?? init;
+    if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) return init;
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (decl && (ts.isFunctionDeclaration(decl) || ts.isMethodDeclaration(decl))) return decl;
+    return null;
   }
 
   /** For URL-building wrappers: try the expr, else descend into children (mirror resolveUrlBuildingCall). */
@@ -63,6 +108,26 @@ export class ConstantEvaluator {
     if (!node || depth > 16) return NONE;
     const direct = this.evalString(node, depth);
     if (direct.value != null) return direct;
+
+    // `const url = stringifyUrl({...})` / `const url = build(...)` → follow the local
+    // const to its initializer and dig the URL out of the builder call.
+    if (ts.isIdentifier(node)) {
+      const init = this.initializerOf(node);
+      return init ? this.resolveUrlBuildingCall(init, depth + 1) : NONE;
+    }
+
+    // stringifyUrl({ url, query }) / fetch-config { url } → prefer a url-like property
+    // (object-literal properties are not Expressions, so forEachChild would skip them).
+    if (ts.isObjectLiteralExpression(node)) {
+      for (const key of ['url', 'path', 'endpoint', 'uri']) {
+        const e = this.propInit(node, key);
+        if (e) {
+          const r = this.resolveUrlBuildingCall(e, depth + 1);
+          if (r.value != null) return r;
+        }
+      }
+    }
+
     let result: EvalString = NONE;
     node.forEachChild((child) => {
       if (result.value != null) return;
@@ -130,9 +195,56 @@ export class ConstantEvaluator {
     // a function parameter is a runtime value, not a constant
     const decl = sym.valueDeclaration ?? sym.declarations?.[0];
     if (decl && ts.isParameter(decl)) return NONE;
+    // destructured local: `const { url } = source` → resolve `source.url`.
+    if (decl && ts.isBindingElement(decl)) {
+      const r = this.resolveBindingElement(decl, depth);
+      if (r.value != null) return r;
+    }
     const init = this.initializerOfSymbol(sym);
     if (init) return this.evalString(init, depth + 1);
     return NONE;
+  }
+
+  /** `const { url } = source` / `const { url: u } = source` → evaluate the source's property. */
+  private resolveBindingElement(be: ts.BindingElement, depth: number): EvalString {
+    const key = be.propertyName ? this.propName(be.propertyName) : ts.isIdentifier(be.name) ? be.name.text : null;
+    if (!key) return NONE;
+    const pattern = be.parent;
+    if (!ts.isObjectBindingPattern(pattern)) return NONE;
+    // Only local destructures are constant; a destructured parameter is a runtime value.
+    const owner = pattern.parent;
+    if (ts.isVariableDeclaration(owner) && owner.initializer) {
+      return this.evalPropertyOf(owner.initializer, key, depth);
+    }
+    return NONE;
+  }
+
+  /** Resolve `<obj>.<key>` where obj is an object literal (following a const identifier first). */
+  private evalPropertyOf(objExpr: ts.Expression, key: string, depth: number): EvalString {
+    let obj: ts.Expression | undefined = objExpr;
+    if (ts.isIdentifier(obj)) obj = this.initializerOf(obj) ?? obj;
+    if (obj && ts.isObjectLiteralExpression(obj)) {
+      const e = this.propInit(obj, key);
+      if (e) return this.evalString(e, depth + 1);
+    }
+    return NONE;
+  }
+
+  private initializerOf(node: ts.Expression): ts.Expression | undefined {
+    return this.initializerOfSymbol(this.symbolAt(node));
+  }
+
+  private propName(name: ts.PropertyName): string | null {
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) return name.text;
+    return null;
+  }
+
+  private propInit(obj: ts.ObjectLiteralExpression, key: string): ts.Expression | undefined {
+    for (const p of obj.properties) {
+      if (ts.isPropertyAssignment(p) && this.propName(p.name) === key) return p.initializer;
+      if (ts.isShorthandPropertyAssignment(p) && p.name.text === key) return p.name;
+    }
+    return undefined;
   }
 
   /** Returns the env var name for import.meta.env.X / process.env.X, else null. */
@@ -158,6 +270,12 @@ export class ConstantEvaluator {
   }
 
   private symbolAt(node: ts.Node): ts.Symbol | undefined {
+    // `{ url }` shorthand: getSymbolAtLocation yields the property symbol, not the local
+    // value it references. Resolve to the value symbol so `const url = ...; f({ url })` folds.
+    if (ts.isIdentifier(node) && node.parent && ts.isShorthandPropertyAssignment(node.parent)) {
+      const valSym = this.checker.getShorthandAssignmentValueSymbol(node.parent);
+      if (valSym) return valSym;
+    }
     let sym = this.checker.getSymbolAtLocation(node);
     if (sym && sym.flags & ts.SymbolFlags.Alias) {
       try {
