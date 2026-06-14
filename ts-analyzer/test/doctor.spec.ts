@@ -47,6 +47,36 @@ describe('doctor / checkGraph', () => {
     expect(h.ok).toBe(false);
   });
 
+  it('treats a self-loop-only node as an orphan (not connectivity)', () => {
+    const g = graph();
+    g.nodes.push(makeNode({ id: 'P::Recur', fqcn: 'P', method: 'Recur', layer: 'COMPONENT', project: 'p' }));
+    g.edges.push(edge('P::Recur', 'P::Recur', 'render'));
+    const h = checkGraph(g);
+    expect(h.orphans.ids).toContain('P::Recur');
+  });
+
+  it('classifies a routed leaf SCREEN as a leaf-screen, not an orphan', () => {
+    const g = graph();
+    g.nodes.push(makeNode({ id: 'P::Report', fqcn: 'P', method: 'Report', layer: 'SCREEN', project: 'p', endpoint: '/report' }));
+    const h = checkGraph(g);
+    expect(h.leafScreens).toBe(1);
+    expect(h.orphans.ids).not.toContain('P::Report'); // routed entry point, not an orphan
+    // a SCREEN with NO route (endpoint null) is still an orphan
+    g.nodes.push(makeNode({ id: 'P::Floating', fqcn: 'P', method: 'Floating', layer: 'SCREEN', project: 'p' }));
+    expect(checkGraph(g).orphans.ids).toContain('P::Floating');
+  });
+
+  it('judges hooks by call edges, components by render edges (componentsNeverRendered)', () => {
+    const g = graph();
+    // a hook reached by a 'call' edge is "used"; a hook with no incoming is not
+    g.nodes.push(makeNode({ id: 'P::useThing', fqcn: 'P', method: 'useThing', layer: 'HOOK', project: 'p' }));
+    g.nodes.push(makeNode({ id: 'P::useUnused', fqcn: 'P', method: 'useUnused', layer: 'HOOK', project: 'p' }));
+    g.edges.push(edge('P::Child', 'P::useThing', 'call'));
+    const h = checkGraph(g);
+    // Lonely (component, no render-in) + useUnused (hook, no call-in) = 2; useThing is used.
+    expect(h.componentsNeverRendered).toBe(2);
+  });
+
   it('reports ok on a fully connected graph', () => {
     const g = graph();
     g.nodes = g.nodes.filter((n) => n.id !== 'P::Lonely');

@@ -59,39 +59,41 @@ function loadEnvFile(path?: string): Record<string, string> {
   return out;
 }
 
-/** In-process analysis (single Program per project) — the original path. */
-function analyzeInProcess(repo: string, opts: Opts): IrFile[] {
-  const common = {
-    repoRoot: repo,
-    projectFilter: opts.flags['--project'] ?? null,
-    env: loadEnvFile(opts.flags['--env']),
-  };
-  // React and Vue projects are auto-detected per directory; both emit the same IrFile[].
-  const reactFiles = new TsResolver().analyze(common);
-  const vueFiles = new VueResolver().analyze({ ...common, mode: opts.flags['--mode'] ?? 'development' });
-  return [...reactFiles, ...vueFiles];
+/** Analyze ONE project root in-process (React and/or Vue) → IrFile[]. */
+function analyzeOneRoot(root: string, repoRoot: string, opts: Opts): IrFile[] {
+  const common = { repoRoot, projectFilter: null, env: loadEnvFile(opts.flags['--env']) };
+  const files: IrFile[] = [];
+  if (isReactProject(root)) files.push(...new TsResolver().analyzeRoot(root, repoRoot, common));
+  if (isVueProject(root)) {
+    files.push(...new VueResolver().analyzeRoot(root, repoRoot, { ...common, mode: opts.flags['--mode'] ?? 'development' }));
+  }
+  return files;
 }
 
 async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: number; repo: string }> {
   const repo = opts.flags['--repo'] ?? '../.repo';
+  const repoRoot = path.resolve(repo);
   const splitOff = '--no-split' in opts.flags;
-  const requestedWorkers = opts.flags['--workers'] ? parseInt(opts.flags['--workers'], 10) : null;
+  const w = parseInt(opts.flags['--workers'] ?? '', 10);
+  const requestedWorkers = Number.isFinite(w) && w > 0 ? w : null; // ignore missing/NaN/<=0
 
-  // Split a large repo/workspace into per-project-root child processes so each
-  // giant ts.Program's memory is released after its worker exits. Only worth it
-  // when there is more than one root to spread across processes.
-  const roots = splitOff ? [] : discoverProjectRoots(repo, opts.flags['--project'] ?? null);
+  // Single source of truth for the project set, so the graph is IDENTICAL whether
+  // we split into child processes or run in-process.
+  const roots = discoverProjectRoots(repo, opts.flags['--project'] ?? null);
   let files: IrFile[];
-  if (roots.length > 1 && (requestedWorkers ?? 2) > 1) {
+  if (!splitOff && roots.length > 1 && (requestedWorkers ?? 2) > 1) {
+    // Split into per-root child processes so each giant ts.Program's memory is
+    // freed when its worker exits; the parent only merges the lightweight IR.
     const plan = planWorkers(roots.length, requestedWorkers);
     files = await runProjectWorkers(roots, plan, {
       entry: process.argv[1],
-      repoRoot: path.resolve(repo),
+      repoRoot,
       envFile: opts.flags['--env'] || undefined,
       mode: opts.flags['--mode'] || undefined,
     });
   } else {
-    files = analyzeInProcess(repo, opts);
+    files = [];
+    for (const root of roots) files.push(...analyzeOneRoot(root, repoRoot, opts));
   }
   const graph = new GraphBuilder(files).build();
   return { graph, fileCount: files.length, repo };
@@ -101,19 +103,22 @@ async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: n
 function cmdIr(opts: Opts): void {
   const root = path.resolve(opts.flags['--root'] ?? '.');
   const repoRoot = path.resolve(opts.flags['--repo'] ?? '../.repo');
-  const common = { repoRoot, projectFilter: null, env: loadEnvFile(opts.flags['--env']) };
-  const files: IrFile[] = [];
-  if (isReactProject(root)) files.push(...new TsResolver().analyzeRoot(root, repoRoot, common));
-  if (isVueProject(root)) {
-    files.push(...new VueResolver().analyzeRoot(root, repoRoot, { ...common, mode: opts.flags['--mode'] ?? 'development' }));
-  }
+  const files = analyzeOneRoot(root, repoRoot, opts);
   const out = opts.flags['--out'];
   if (out) fs.writeFileSync(out, JSON.stringify(files));
   else process.stdout.write(JSON.stringify(files));
 }
 
+function readGraphFile(p: string): CallGraph {
+  if (!fs.existsSync(p)) {
+    process.stderr.write(`graph file not found: ${p}\n`);
+    process.exit(1);
+  }
+  return jsonOutput.read(fs.readFileSync(p, 'utf8'));
+}
+
 async function graphFromOpts(opts: Opts): Promise<CallGraph> {
-  if (opts.flags['--graph']) return jsonOutput.read(fs.readFileSync(opts.flags['--graph'], 'utf8'));
+  if (opts.flags['--graph']) return readGraphFile(opts.flags['--graph']);
   return (await analyzeRepo(opts)).graph;
 }
 
@@ -158,6 +163,12 @@ function cmdJoin(opts: Opts): void {
   if (!graphPath || !backendPath) {
     process.stderr.write('join: --graph front.json --backend backend.json required\n');
     process.exit(2);
+  }
+  for (const [label, p] of [['--graph', graphPath], ['--backend', backendPath]] as const) {
+    if (!fs.existsSync(p)) {
+      process.stderr.write(`join: ${label} file not found: ${p}\n`);
+      process.exit(1);
+    }
   }
   const frontend = jsonOutput.read(fs.readFileSync(graphPath, 'utf8'));
   const backend = jsonOutput.read(fs.readFileSync(backendPath, 'utf8'));

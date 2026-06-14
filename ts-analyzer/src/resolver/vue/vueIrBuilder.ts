@@ -123,8 +123,18 @@ export class VueResolver implements Resolver {
     // For import-aware resolution: absolute .vue path → component id, and the set
     // of project .vue paths to resolve specifiers against.
     const realToId = new Map<string, string>();
-    for (const r of comps) realToId.set(path.resolve(r.real), r.comp.id);
+    const idToName = new Map<string, string>();
+    for (const r of comps) {
+      realToId.set(path.resolve(r.real), r.comp.id);
+      idToName.set(r.comp.id, r.comp.name);
+    }
     const vueReal = new Set(realToId.keys());
+
+    // Global registrations: `Vue.component(X.name, X)` / `Vue.component('tag', X)`
+    // in plugins make a component usable as a tag with no local import. Resolves
+    // the otherwise-ambiguous globally-registered components (the parent picks a
+    // specific one). tagKey → component id.
+    const globalRegistry = this.buildGlobalRegistry(pp.sourceFiles, realToId, idToName, projectRoot, vueReal);
 
     // Nuxt layouts host pages via `<nuxt/>`. Map each page to its layout
     // (declared `layout:` or 'default') so the layout → page render edge connects
@@ -144,8 +154,8 @@ export class VueResolver implements Resolver {
 
     // Pass 2: parse each template → render usages (parent → child edges).
     for (const r of comps) {
-      const localImports = this.localComponentImports(r.sf, r.real, projectRoot, realToId, vueReal);
-      const usages = this.renderUsages(r.real, r.comp.id, localImports, nameIndex, fileIndex);
+      const local = this.localComponentImports(r.sf, r.real, projectRoot, realToId, vueReal);
+      const usages = this.renderUsages(r.real, r.comp.id, local.map, local.lazy, globalRegistry, nameIndex, fileIndex);
       if (r.isLayout) {
         for (const pageId of layoutChildren.get(r.comp.id) ?? []) {
           usages.push({ tagName: 'nuxt', targetComponentId: pageId, lazy: false, line: null });
@@ -164,9 +174,11 @@ export class VueResolver implements Resolver {
   }
 
   /**
-   * Map a parent SFC's locally-imported component identifiers to their component
-   * ids (`import MobileAuthForm from '@/components/recover/MobileAuthForm'`).
-   * This disambiguates same-named components — the parent's own import wins.
+   * Map a parent SFC's locally-available component tags to component ids:
+   *   - top-level `import X from '...'`
+   *   - `components: { Tag, Alias: X, Lazy: () => import('...') }` registration
+   * keyed by the registration tag (or the import identifier). The parent's own
+   * registration disambiguates same-named components.
    */
   private localComponentImports(
     sf: ts.SourceFile,
@@ -174,23 +186,74 @@ export class VueResolver implements Resolver {
     projectRoot: string,
     realToId: Map<string, string>,
     vueReal: Set<string>,
-  ): Map<string, string> {
+  ): { map: Map<string, string>; lazy: Set<string> } {
     const out = new Map<string, string>();
-    for (const stmt of sf.statements) {
-      if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
-      const resolved = resolveVueSpecifier(stmt.moduleSpecifier.text, real, projectRoot, vueReal);
-      if (!resolved) continue;
-      const id = realToId.get(path.resolve(resolved));
-      if (!id) continue;
-      const names: string[] = [];
-      const clause = stmt.importClause;
-      if (clause?.name) names.push(clause.name.text); // default import
-      if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-        for (const el of clause.namedBindings.elements) names.push(el.name.text);
+    const lazy = new Set<string>(); // tags registered via `() => import(...)`
+    const imports = importMapOf(sf, real, projectRoot, realToId, vueReal);
+    for (const [ident, id] of imports) out.set(tagKey(ident), id);
+
+    const obj = findDefaultExportObject(sf);
+    const comps = obj && objectProp(obj, 'components');
+    if (comps) {
+      for (const p of comps.properties) {
+        if (ts.isShorthandPropertyAssignment(p)) {
+          const id = imports.get(p.name.text);
+          if (id) out.set(tagKey(p.name.text), id);
+        } else if (ts.isPropertyAssignment(p)) {
+          const key = propName(p);
+          if (!key) continue;
+          let id: string | undefined;
+          if (ts.isIdentifier(p.initializer)) id = imports.get(p.initializer.text);
+          else {
+            const spec = findDynamicImportPath(p.initializer);
+            const resolved = spec && resolveVueSpecifier(spec, real, projectRoot, vueReal);
+            if (resolved) {
+              id = realToId.get(path.resolve(resolved));
+              if (id) lazy.add(tagKey(key));
+            }
+          }
+          if (id) out.set(tagKey(key), id);
+        }
       }
-      for (const n of names) out.set(tagKey(n), id);
     }
-    return out;
+    return { map: out, lazy };
+  }
+
+  /** Scan all source files for `Vue.component(...)` global registrations. */
+  private buildGlobalRegistry(
+    sourceFiles: readonly ts.SourceFile[],
+    realToId: Map<string, string>,
+    idToName: Map<string, string>,
+    projectRoot: string,
+    vueReal: Set<string>,
+  ): Map<string, string> {
+    const registry = new Map<string, string>();
+    for (const sf of sourceFiles) {
+      const real = realOf(sf.fileName);
+      const imports = importMapOf(sf, real, projectRoot, realToId, vueReal);
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isPropertyAccessExpression(node.expression) &&
+          ts.isIdentifier(node.expression.expression) &&
+          node.expression.expression.text === 'Vue' &&
+          node.expression.name.text === 'component'
+        ) {
+          const [arg0, arg1] = node.arguments;
+          const id = arg1 && ts.isIdentifier(arg1) ? imports.get(arg1.text) : undefined;
+          if (id) {
+            // tag = string literal, or X.name → the component's declared name
+            let tag: string | null = null;
+            if (arg0 && ts.isStringLiteralLike(arg0)) tag = arg0.text;
+            else if (arg0 && ts.isPropertyAccessExpression(arg0) && arg0.name.text === 'name') tag = idToName.get(id) ?? null;
+            if (tag) registry.set(tagKey(tag), id);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return registry;
   }
 
   /** Parse an SFC template (Pug/HTML) and resolve child tags to component ids. */
@@ -198,12 +261,16 @@ export class VueResolver implements Resolver {
     real: string,
     selfId: string,
     localImports: Map<string, string>,
+    lazyTags: Set<string>,
+    globalRegistry: Map<string, string>,
     nameIndex: Map<string, Set<string>>,
     fileIndex: Map<string, Set<string>>,
   ): IrJsxUsage[] {
     const resolve = (key: string): string | null => {
       const local = localImports.get(key);
-      if (local) return local; // parent's own import disambiguates
+      if (local) return local; // parent's own import/registration disambiguates
+      const global = globalRegistry.get(key);
+      if (global) return global; // Vue.component(...) global registration
       const byName = nameIndex.get(key);
       if (byName && byName.size === 1) return [...byName][0];
       const byFile = fileIndex.get(key);
@@ -222,10 +289,11 @@ export class VueResolver implements Resolver {
     for (const t of extractTemplateTags(blocks.templateContent, blocks.templateLang)) {
       const target = resolve(tagKey(t.tag));
       if (target === selfId) continue; // a component self-referencing its own tag — skip
-      const key = `${t.tag}::${target ?? ''}`;
+      const tk = tagKey(t.tag);
+      const key = `${tk}::${target ?? ''}`; // collapse casing variants to one edge
       if (seen.has(key)) continue; // one render edge per distinct child
       seen.add(key);
-      usages.push({ tagName: t.tag, targetComponentId: target, lazy: false, line: blocks.templateStartLine + t.line });
+      usages.push({ tagName: t.tag, targetComponentId: target, lazy: lazyTags.has(tk), line: blocks.templateStartLine + t.line });
     }
     return usages;
   }
@@ -343,6 +411,55 @@ function resolveVueSpecifier(spec: string, containingReal: string, projectRoot: 
   const candidates = spec.endsWith('.vue') ? [base] : [base + '.vue', path.join(base, 'index.vue')];
   for (const c of candidates) if (vueReal.has(path.resolve(c))) return c;
   return undefined;
+}
+
+/** Map a file's import identifiers (default + named) to project component ids. */
+function importMapOf(
+  sf: ts.SourceFile,
+  real: string,
+  projectRoot: string,
+  realToId: Map<string, string>,
+  vueReal: Set<string>,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const stmt of sf.statements) {
+    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const resolved = resolveVueSpecifier(stmt.moduleSpecifier.text, real, projectRoot, vueReal);
+    if (!resolved) continue;
+    const id = realToId.get(path.resolve(resolved));
+    if (!id) continue;
+    const clause = stmt.importClause;
+    if (clause?.name) out.set(clause.name.text, id); // default import
+    if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      for (const el of clause.namedBindings.elements) out.set(el.name.text, id);
+    }
+  }
+  return out;
+}
+
+/** Extract the literal specifier from a `() => import('path')` (or `.then(...)`) expression. */
+function findDynamicImportPath(node: ts.Node): string | null {
+  let found: string | null = null;
+  const visit = (n: ts.Node) => {
+    if (found) return;
+    if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const arg = n.arguments[0];
+      if (arg && ts.isStringLiteralLike(arg)) found = arg.text;
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(node);
+  return found;
+}
+
+/** A property whose value is an object literal, e.g. `components: { ... }`. */
+function objectProp(obj: ts.ObjectLiteralExpression, key: string): ts.ObjectLiteralExpression | null {
+  for (const p of obj.properties) {
+    if (ts.isPropertyAssignment(p) && propName(p) === key && ts.isObjectLiteralExpression(p.initializer)) {
+      return p.initializer;
+    }
+  }
+  return null;
 }
 
 function within(file: string, dir: string): boolean {

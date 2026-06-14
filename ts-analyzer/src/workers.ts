@@ -9,6 +9,7 @@
  */
 
 import { spawn, spawnSync } from 'child_process';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -63,9 +64,18 @@ export function planWorkers(roots: number, requested?: number | null): WorkerPla
   let workers = requested && requested > 0 ? requested : Math.min(cpus, byMem);
   workers = Math.max(1, Math.min(workers, roots));
   const override = parseInt(process.env[SIZE_ENV] ?? '', 10);
-  const perWorkerMB = Number.isFinite(override) && override > 0
-    ? override
-    : Math.max(4096, Math.floor(budgetMB / workers));
+  let perWorkerMB: number;
+  if (Number.isFinite(override) && override > 0) {
+    // FLOWMAP_MAX_OLD_SPACE is the per-process heap; cap concurrency so the
+    // summed worker heaps still fit the RAM budget.
+    perWorkerMB = override;
+    workers = Math.max(1, Math.min(workers, Math.floor(budgetMB / override) || 1));
+  } else {
+    perWorkerMB = Math.max(4096, Math.floor(budgetMB / workers));
+    // An explicit `requested` count can exceed the budget once perWorkerMB is
+    // floored at 4GB — cap concurrency so summed heaps still fit.
+    workers = Math.max(1, Math.min(workers, Math.floor(budgetMB / perWorkerMB) || 1));
+  }
   return { workers, perWorkerMB };
 }
 
@@ -77,11 +87,13 @@ export interface WorkerArgs {
 }
 
 function tmpFor(root: string): string {
-  // pid + path length disambiguates same-basename members across the tree.
-  return path.join(os.tmpdir(), `flowmap-ir-${process.pid}-${path.basename(root)}-${root.length}.json`);
+  // Hash the absolute path so distinct roots never collide (same basename + same
+  // path length would otherwise clash).
+  const h = createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 12);
+  return path.join(os.tmpdir(), `flowmap-ir-${process.pid}-${h}.json`);
 }
 
-function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[]> {
+function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[] | null> {
   return new Promise((resolve) => {
     const tmp = tmpFor(root);
     const args = [a.entry, '__ir', '--root', root, '--repo', a.repoRoot, '--out', tmp];
@@ -95,7 +107,7 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
       if (code !== 0) {
         process.stderr.write(`  ! worker failed for ${path.basename(root)} (exit ${code})\n`);
         cleanup();
-        return resolve([]);
+        return resolve(null); // distinguish failure from a legitimately empty result
       }
       try {
         resolve(JSON.parse(fs.readFileSync(tmp, 'utf8')) as IrFile[]);
@@ -121,8 +133,16 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
 export async function runProjectWorkers(roots: string[], plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[]> {
   process.stderr.write(`analyze: ${roots.length} project roots, ${plan.workers} workers, ${plan.perWorkerMB}MB/worker\n`);
   const batches = await poolRun(roots, plan.workers, (r) => spawnOne(r, plan, a));
+  // If EVERY root failed (non-zero exit, e.g. all out of memory), fail loudly
+  // rather than silently emitting an empty graph that overwrites a good output.
+  if (roots.length > 0 && batches.every((b) => b === null)) {
+    throw new Error(
+      `all ${roots.length} project workers failed (likely out of memory) — ` +
+        `raise the heap (FLOWMAP_MAX_OLD_SPACE) or reduce --workers`,
+    );
+  }
   const all: IrFile[] = [];
-  for (const b of batches) all.push(...b);
+  for (const b of batches) if (b) all.push(...b);
   return all;
 }
 
@@ -133,16 +153,19 @@ function poolRun<T, R>(items: T[], limit: number, task: (t: T) => Promise<R>): P
     let next = 0;
     let done = 0;
     if (!items.length) return resolve(results);
+    const settle = (i: number, r: R) => {
+      results[i] = r;
+      done++;
+      if (done === items.length) resolve(results);
+      else startOne();
+    };
     const startOne = () => {
       if (next >= items.length) return;
       const i = next++;
-      task(items[i]).then((r) => {
-        results[i] = r;
-        done++;
-        if (done === items.length) resolve(results);
-        else startOne();
-      });
+      // A rejected task must still advance the pool, or it deadlocks forever.
+      task(items[i]).then((r) => settle(i, r)).catch(() => settle(i, null as unknown as R));
     };
-    for (let k = 0; k < Math.min(limit, items.length); k++) startOne();
+    const n = Math.max(1, Math.min(limit, items.length)); // never 0 → would deadlock
+    for (let k = 0; k < n; k++) startOne();
   });
 }

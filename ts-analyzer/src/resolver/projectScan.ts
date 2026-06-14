@@ -106,16 +106,32 @@ function collect(dir: string, depth: number, roots: Set<string>): void {
   }
   const before = roots.size;
   for (const sub of childDirs(dir)) collect(sub, depth + 1, roots);
-  if (roots.size === before && isProjectBySource(dir)) roots.add(dir);
+  // Source-only fallback ONLY at the top level — never split an app's own
+  // src/components, src/pages, … into separate "projects".
+  if (roots.size === before && depth === 0 && isProjectBySource(dir)) roots.add(dir);
 }
 
 /**
- * Discover analyzable project roots under `repoRoot`. `filter` restricts to the
- * top-level directory of that name (matching `--project` semantics), then splits
- * it into member packages if it is a workspace. Returns absolute dirs, sorted.
+ * Discover analyzable project roots under `repoRoot`. If `repoRoot` is itself a
+ * project (or workspace) — e.g. `--repo .repo/my-app` — it is treated as the one
+ * root rather than fragmented into its source subdirs. Otherwise `repoRoot` is a
+ * container of project dirs (the `.repo/<project>` convention); `filter`
+ * restricts to the child of that name (matching `--project`). Workspaces split
+ * into member packages. Returns absolute dirs, sorted.
  */
 export function discoverProjectRoots(repoRoot: string, filter?: string | null): string[] {
   const root = path.resolve(repoRoot);
+
+  // repoRoot is itself an app/workspace → collect it directly (no child scan).
+  // A `--project` filter then selects by basename (the app itself, or a member).
+  if (pkgKind(root) !== null) {
+    const roots = new Set<string>();
+    collect(root, 0, roots);
+    let list = [...roots];
+    if (filter) list = list.filter((r) => path.basename(r) === filter);
+    return list.sort();
+  }
+
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
