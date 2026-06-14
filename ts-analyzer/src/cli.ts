@@ -170,6 +170,30 @@ function dump(graph: CallGraph, out: string | undefined, meta: Record<string, un
   }
 }
 
+/**
+ * Graph files to join against the backend, derived from disk so it works even
+ * when analyze didn't run this invocation (e.g. `pipeline --only join`). For a
+ * split repo these are the per-root `<base>-<root>.json` files; for a single
+ * graph it's `<base>.json`. Derived artifacts (.join/.screens/.openapi/.impact)
+ * are excluded. Returns absolute-ish paths (joined with `dir`).
+ */
+function listGraphsToJoin(dir: string, base: string): string[] {
+  const derived = /\.(join|screens|openapi|impact)\.json$/;
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const perRoot = names
+    .filter((f) => f.startsWith(`${base}-`) && f.endsWith('.json') && !derived.test(f))
+    .sort()
+    .map((f) => path.join(dir, f));
+  if (perRoot.length) return perRoot;
+  const single = path.join(dir, `${base}.json`);
+  return fs.existsSync(single) ? [single] : [];
+}
+
 /** Rescan the output directory of `out` and (re)write `_manifest.json`. */
 function refreshManifest(out: string | undefined): void {
   if (!out) return;
@@ -185,23 +209,19 @@ function refreshManifest(out: string | undefined): void {
 async function cmdAnalyze(opts: Opts): Promise<void> {
   const { combined, fileCount, repo, services } = await analyzeRepoSplit(opts);
   const out = opts.flags['--out'];
-  dump(combined, out, {
-    command: 'analyze',
-    repo,
-    project: opts.flags['--project'] ?? null,
-    files: fileCount,
-    nodes: combined.nodes.length,
-    edges: combined.edges.length,
-    services: services.map((s) => s.name),
-  });
-  // Each project root → its own `<service>.json` (a distinct service), so the
-  // _manifest.json catalogues them individually. Combined graph stays as `--out`.
+
+  // Multiple project roots → split, ONE self-contained graph per root as
+  // `<name>-<service>.json`. We deliberately do NOT emit a merged whole-repo
+  // graph: merging large independent services back into one defeats the point
+  // of splitting them (and collapses same-id nodes across services). Every
+  // analyzed node belongs to exactly one root, so there is no "leftover" graph
+  // to write at `<name>.json` either. The _manifest.json rescans the dir and
+  // catalogues each per-root graph individually.
   if (out && services.length > 1) {
     const dir = path.dirname(out) || '.';
-    const combinedBase = path.basename(out, '.json');
+    const base = path.basename(out, '.json');
     for (const s of services) {
-      if (s.name === combinedBase) continue; // never clobber the combined graph
-      dump(s.graph, path.join(dir, `${s.name}.json`), {
+      dump(s.graph, path.join(dir, `${base}-${s.name}.json`), {
         command: 'analyze',
         repo,
         project: s.name,
@@ -211,7 +231,21 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
         edges: s.graph.edges.length,
       });
     }
+    refreshManifest(out);
+    return;
   }
+
+  // Single root (or whole-repo single program, or stdout): `<name>.json` holds
+  // the one graph.
+  dump(combined, out, {
+    command: 'analyze',
+    repo,
+    project: opts.flags['--project'] ?? null,
+    files: fileCount,
+    nodes: combined.nodes.length,
+    edges: combined.edges.length,
+    services: services.map((s) => s.name),
+  });
   refreshManifest(out);
 }
 
@@ -309,12 +343,28 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   const noSplit = '--no-split' in opts.flags || /^(1|true|yes)$/i.test(cfg.NO_SPLIT ?? '');
   const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
 
+  // `--only a,b` runs just those stages (reusing prior outputs for the rest).
+  // e.g. `--only join` re-runs join against the existing graph.json without
+  // re-analyzing. Default: all three stages.
+  const ALL_STEPS = ['analyze', 'screens', 'join'] as const;
+  const onlyRaw = pick('--only', 'ONLY');
+  const steps = new Set<string>(ALL_STEPS);
+  if (onlyRaw) {
+    const requested = onlyRaw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const bad = requested.filter((s) => !ALL_STEPS.includes(s as (typeof ALL_STEPS)[number]));
+    if (bad.length) {
+      process.stderr.write(`pipeline: unknown --only step(s): ${bad.join(', ')} (valid: ${ALL_STEPS.join(', ')})\n`);
+      process.exit(2);
+    }
+    steps.clear();
+    for (const s of requested) steps.add(s);
+  }
+
   fs.mkdirSync(outDir, { recursive: true });
   // Output file base: explicit NAME, else PROJECT, else "graph" (whole-repo run).
   const base = pick('--name', 'NAME') || project || 'graph';
   const graphOut = path.join(outDir, `${base}.json`);
   const screensOut = path.join(outDir, `${base}.screens.json`);
-  const joinOut = path.join(outDir, `${base}.join.json`);
 
   // Shared flags passed down to each step.
   const common: Record<string, string> = { '--repo': repo };
@@ -325,27 +375,47 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   if (workers) common['--workers'] = workers;
   if (noSplit) common['--no-split'] = '';
 
-  // 0) refresh checkout
-  refreshRepo(path.resolve(repo), project, pull);
+  // 0) refresh checkout (only meaningful when analyze runs)
+  if (steps.has('analyze')) refreshRepo(path.resolve(repo), project, pull);
 
   // 1) analyze
-  process.stderr.write(`\n[1/3] analyze → ${graphOut}\n`);
-  await cmdAnalyze({ flags: { ...common, '--out': graphOut } });
+  if (steps.has('analyze')) {
+    process.stderr.write(`\n[1/3] analyze → ${graphOut}\n`);
+    await cmdAnalyze({ flags: { ...common, '--out': graphOut } });
+  } else {
+    process.stderr.write(`\n[1/3] analyze skipped (--only ${[...steps].join(',')})\n`);
+  }
 
   // 2) screens (no --workers/--no-split; screens has its own light path)
-  process.stderr.write(`\n[2/3] screens → ${screensOut}\n`);
-  const screensFlags: Record<string, string> = { '--repo': repo, '--out': screensOut };
-  if (project) screensFlags['--project'] = project;
-  cmdScreens({ flags: screensFlags });
+  if (steps.has('screens')) {
+    process.stderr.write(`\n[2/3] screens → ${screensOut}\n`);
+    const screensFlags: Record<string, string> = { '--repo': repo, '--out': screensOut };
+    if (project) screensFlags['--project'] = project;
+    cmdScreens({ flags: screensFlags });
+  } else {
+    process.stderr.write(`\n[2/3] screens skipped (--only ${[...steps].join(',')})\n`);
+  }
 
-  // 3) join (skipped if no backend graph configured/present)
-  if (!backend) {
+  // 3) join — one join per front graph (per-root for a split repo), each written
+  // as `<graph>.join.json`. Skipped if no backend graph configured/present.
+  if (!steps.has('join')) {
+    process.stderr.write(`\n[3/3] join skipped (--only ${[...steps].join(',')})\n`);
+  } else if (!backend) {
     process.stderr.write(`\n[3/3] join skipped — set BACKEND in config (or --backend) to enable\n`);
   } else if (!fs.existsSync(backend)) {
     process.stderr.write(`\n[3/3] join skipped — backend graph not found: ${backend}\n`);
   } else {
-    process.stderr.write(`\n[3/3] join → ${joinOut}\n`);
-    cmdJoin({ flags: { '--graph': graphOut, '--backend': backend, '--out': joinOut } });
+    const graphs = listGraphsToJoin(outDir, base);
+    if (!graphs.length) {
+      // join reuses the analyze output; without it there is nothing to join.
+      process.stderr.write(`\n[3/3] join: no front graph found in ${outDir} — run analyze first (drop --only)\n`);
+      process.exit(1);
+    }
+    process.stderr.write(`\n[3/3] join → ${graphs.length} graph(s)\n`);
+    for (const g of graphs) {
+      const joinOut = g.replace(/\.json$/, '.join.json');
+      cmdJoin({ flags: { '--graph': g, '--backend': backend, '--out': joinOut } });
+    }
   }
   process.stderr.write(`\ndone.\n`);
 }
@@ -384,12 +454,33 @@ async function cmdSearch(opts: Opts): Promise<void> {
 
 function cmdScreens(opts: Opts): void {
   const repo = opts.flags['--repo'] ?? '../.repo';
-  const doc = buildScreens({ repoRoot: repo, projectFilter: opts.flags['--project'] ?? null });
+  const out = opts.flags['--out'];
+  const project = opts.flags['--project'] ?? null;
+
+  // Mirror analyze: a split repo gets ONE screens doc per root, named to pair
+  // with that root's graph (`<name>-<root>.screens.json`), so the manifest links
+  // each per-root graph to its own screens. Single root → the plain `<out>`.
+  const roots = discoverProjectRoots(repo, project);
+  if (out && roots.length > 1) {
+    const repoRoot = path.resolve(repo);
+    const dir = path.dirname(out) || '.';
+    const stem = path.basename(out).replace(/\.screens\.json$/, '').replace(/\.json$/, '');
+    for (const root of roots) {
+      const doc = buildScreens({ repoRoot: repo, roots: [root] });
+      const outPath = path.join(dir, `${stem}-${serviceName(repoRoot, root)}.screens.json`);
+      fs.writeFileSync(outPath, jsonOutput.writeValue(doc));
+      process.stderr.write(`wrote ${outPath}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
+    }
+    refreshManifest(out);
+    return;
+  }
+
+  const doc = buildScreens({ repoRoot: repo, projectFilter: project });
   const text = jsonOutput.writeValue(doc);
-  if (opts.flags['--out']) {
-    fs.writeFileSync(opts.flags['--out'], text);
-    process.stderr.write(`wrote ${opts.flags['--out']}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
-    refreshManifest(opts.flags['--out']);
+  if (out) {
+    fs.writeFileSync(out, text);
+    process.stderr.write(`wrote ${out}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
+    refreshManifest(out);
   } else {
     process.stdout.write(text + '\n');
   }
@@ -430,7 +521,8 @@ function usage(): void {
   process.stderr.write(
     [
       'flowmap-react (TypeScript Compiler API)',
-      '  pipeline [--config flowmap.config]   # refresh repo → analyze → screens → join, options from config',
+      '  pipeline [--config flowmap.config] [--only analyze,screens,join]   # refresh repo → analyze → screens → join, options from config',
+      '          # --only join: re-run just join against the existing per-root graphs (no re-analyze)',
       '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--env-profile name] [--mode development|production]',
       '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
       '  join    --graph front.json --backend backend.json [--out join.json]',
