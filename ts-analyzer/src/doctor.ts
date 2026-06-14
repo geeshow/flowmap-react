@@ -91,6 +91,8 @@ export function checkGraph(graph: CallGraph): GraphHealth {
 
   const is = (n: MethodNode, ...ls: Layer[]) => ls.includes(n.layer);
   const hasRenderIn = (d: Degree) => [...d.inByRelation].some((r) => RENDER_RELATIONS.has(r));
+  // Components are reached via render edges; hooks via call edges — judge each correctly.
+  const used = (n: MethodNode, d: Degree) => (n.layer === 'HOOK' ? d.in > 0 : hasRenderIn(d));
   let componentsNeverRendered = 0;
   let screensWithoutRoute = 0;
   let storesNeverReferenced = 0;
@@ -98,7 +100,7 @@ export function checkGraph(graph: CallGraph): GraphHealth {
   let unresolvedApi = 0;
   for (const n of graph.nodes) {
     const d = deg.get(n.id)!;
-    if (is(n, 'COMPONENT', 'HOOK') && !hasRenderIn(d)) componentsNeverRendered++;
+    if (is(n, 'COMPONENT', 'HOOK') && !used(n, d)) componentsNeverRendered++;
     // A SCREEN carries its route path in `endpoint` (graphBuilder emits no 'route' edge).
     if (is(n, 'SCREEN') && n.endpoint == null) screensWithoutRoute++;
     if (is(n, 'STORE') && d.in === 0) storesNeverReferenced++;

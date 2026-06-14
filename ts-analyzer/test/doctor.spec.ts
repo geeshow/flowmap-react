@@ -66,6 +66,17 @@ describe('doctor / checkGraph', () => {
     expect(checkGraph(g).orphans.ids).toContain('P::Floating');
   });
 
+  it('judges hooks by call edges, components by render edges (componentsNeverRendered)', () => {
+    const g = graph();
+    // a hook reached by a 'call' edge is "used"; a hook with no incoming is not
+    g.nodes.push(makeNode({ id: 'P::useThing', fqcn: 'P', method: 'useThing', layer: 'HOOK', project: 'p' }));
+    g.nodes.push(makeNode({ id: 'P::useUnused', fqcn: 'P', method: 'useUnused', layer: 'HOOK', project: 'p' }));
+    g.edges.push(edge('P::Child', 'P::useThing', 'call'));
+    const h = checkGraph(g);
+    // Lonely (component, no render-in) + useUnused (hook, no call-in) = 2; useThing is used.
+    expect(h.componentsNeverRendered).toBe(2);
+  });
+
   it('reports ok on a fully connected graph', () => {
     const g = graph();
     g.nodes = g.nodes.filter((n) => n.id !== 'P::Lonely');

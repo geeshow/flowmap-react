@@ -93,7 +93,7 @@ function tmpFor(root: string): string {
   return path.join(os.tmpdir(), `flowmap-ir-${process.pid}-${h}.json`);
 }
 
-function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[]> {
+function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[] | null> {
   return new Promise((resolve) => {
     const tmp = tmpFor(root);
     const args = [a.entry, '__ir', '--root', root, '--repo', a.repoRoot, '--out', tmp];
@@ -107,7 +107,7 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
       if (code !== 0) {
         process.stderr.write(`  ! worker failed for ${path.basename(root)} (exit ${code})\n`);
         cleanup();
-        return resolve([]);
+        return resolve(null); // distinguish failure from a legitimately empty result
       }
       try {
         resolve(JSON.parse(fs.readFileSync(tmp, 'utf8')) as IrFile[]);
@@ -133,8 +133,16 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
 export async function runProjectWorkers(roots: string[], plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[]> {
   process.stderr.write(`analyze: ${roots.length} project roots, ${plan.workers} workers, ${plan.perWorkerMB}MB/worker\n`);
   const batches = await poolRun(roots, plan.workers, (r) => spawnOne(r, plan, a));
+  // If EVERY root failed (non-zero exit, e.g. all out of memory), fail loudly
+  // rather than silently emitting an empty graph that overwrites a good output.
+  if (roots.length > 0 && batches.every((b) => b === null)) {
+    throw new Error(
+      `all ${roots.length} project workers failed (likely out of memory) — ` +
+        `raise the heap (FLOWMAP_MAX_OLD_SPACE) or reduce --workers`,
+    );
+  }
   const all: IrFile[] = [];
-  for (const b of batches) all.push(...b);
+  for (const b of batches) if (b) all.push(...b);
   return all;
 }
 
@@ -157,6 +165,7 @@ function poolRun<T, R>(items: T[], limit: number, task: (t: T) => Promise<R>): P
       // A rejected task must still advance the pool, or it deadlocks forever.
       task(items[i]).then((r) => settle(i, r)).catch(() => settle(i, null as unknown as R));
     };
-    for (let k = 0; k < Math.min(limit, items.length); k++) startOne();
+    const n = Math.max(1, Math.min(limit, items.length)); // never 0 → would deadlock
+    for (let k = 0; k < n; k++) startOne();
   });
 }
