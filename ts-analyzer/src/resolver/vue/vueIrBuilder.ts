@@ -63,6 +63,7 @@ export class VueResolver implements Resolver {
       rel: string;
       routes: IrRoute[];
       real: string;
+      sf: ts.SourceFile; // the SFC's <script> source (for import-aware resolution)
       isPage: boolean;
       isLayout: boolean;
       layout: string | null; // declared `layout:` for a page (null → Nuxt 'default')
@@ -99,7 +100,7 @@ export class VueResolver implements Resolver {
           });
         }
         const layout = isPage ? this.pageLayout(sf) : null;
-        comps.push({ comp, rel: ctx.repoRel(sf.fileName), routes, real, isPage, isLayout, layout });
+        comps.push({ comp, rel: ctx.repoRel(sf.fileName), routes, real, sf, isPage, isLayout, layout });
       }
     }
 
@@ -119,6 +120,11 @@ export class VueResolver implements Resolver {
       add(nameIndex, tagKey(r.comp.name), r.comp.id);
       add(fileIndex, tagKey(path.basename(r.real, '.vue')), r.comp.id);
     }
+    // For import-aware resolution: absolute .vue path → component id, and the set
+    // of project .vue paths to resolve specifiers against.
+    const realToId = new Map<string, string>();
+    for (const r of comps) realToId.set(path.resolve(r.real), r.comp.id);
+    const vueReal = new Set(realToId.keys());
 
     // Nuxt layouts host pages via `<nuxt/>`. Map each page to its layout
     // (declared `layout:` or 'default') so the layout → page render edge connects
@@ -138,7 +144,8 @@ export class VueResolver implements Resolver {
 
     // Pass 2: parse each template → render usages (parent → child edges).
     for (const r of comps) {
-      const usages = this.renderUsages(r.real, r.comp.id, nameIndex, fileIndex);
+      const localImports = this.localComponentImports(r.sf, r.real, projectRoot, realToId, vueReal);
+      const usages = this.renderUsages(r.real, r.comp.id, localImports, nameIndex, fileIndex);
       if (r.isLayout) {
         for (const pageId of layoutChildren.get(r.comp.id) ?? []) {
           usages.push({ tagName: 'nuxt', targetComponentId: pageId, lazy: false, line: null });
@@ -156,14 +163,47 @@ export class VueResolver implements Resolver {
     return obj ? stringProp(obj, 'layout') : null;
   }
 
+  /**
+   * Map a parent SFC's locally-imported component identifiers to their component
+   * ids (`import MobileAuthForm from '@/components/recover/MobileAuthForm'`).
+   * This disambiguates same-named components — the parent's own import wins.
+   */
+  private localComponentImports(
+    sf: ts.SourceFile,
+    real: string,
+    projectRoot: string,
+    realToId: Map<string, string>,
+    vueReal: Set<string>,
+  ): Map<string, string> {
+    const out = new Map<string, string>();
+    for (const stmt of sf.statements) {
+      if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+      const resolved = resolveVueSpecifier(stmt.moduleSpecifier.text, real, projectRoot, vueReal);
+      if (!resolved) continue;
+      const id = realToId.get(path.resolve(resolved));
+      if (!id) continue;
+      const names: string[] = [];
+      const clause = stmt.importClause;
+      if (clause?.name) names.push(clause.name.text); // default import
+      if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        for (const el of clause.namedBindings.elements) names.push(el.name.text);
+      }
+      for (const n of names) out.set(tagKey(n), id);
+    }
+    return out;
+  }
+
   /** Parse an SFC template (Pug/HTML) and resolve child tags to component ids. */
   private renderUsages(
     real: string,
     selfId: string,
+    localImports: Map<string, string>,
     nameIndex: Map<string, Set<string>>,
     fileIndex: Map<string, Set<string>>,
   ): IrJsxUsage[] {
     const resolve = (key: string): string | null => {
+      const local = localImports.get(key);
+      if (local) return local; // parent's own import disambiguates
       const byName = nameIndex.get(key);
       if (byName && byName.size === 1) return [...byName][0];
       const byFile = fileIndex.get(key);
@@ -288,6 +328,21 @@ export class VueResolver implements Resolver {
 
 function realOf(fileName: string): string {
   return fileName.endsWith('.vue.ts') ? fileName.slice(0, -3) : fileName;
+}
+
+/** Resolve a relative/aliased (`@`/`~`) import specifier to a project `.vue` file. */
+function resolveVueSpecifier(spec: string, containingReal: string, projectRoot: string, vueReal: Set<string>): string | undefined {
+  let base: string;
+  if (spec.startsWith('.')) {
+    base = path.resolve(path.dirname(containingReal), spec);
+  } else if (/^[@~]{1,2}\//.test(spec)) {
+    base = path.resolve(projectRoot, spec.replace(/^[@~]{1,2}\//, ''));
+  } else {
+    return undefined; // bare module — not a project component
+  }
+  const candidates = spec.endsWith('.vue') ? [base] : [base + '.vue', path.join(base, 'index.vue')];
+  for (const c of candidates) if (vueReal.has(path.resolve(c))) return c;
+  return undefined;
 }
 
 function within(file: string, dir: string): boolean {
