@@ -47,6 +47,14 @@ describe('doctor / checkGraph', () => {
     expect(h.ok).toBe(false);
   });
 
+  it('treats a self-loop-only node as an orphan (not connectivity)', () => {
+    const g = graph();
+    g.nodes.push(makeNode({ id: 'P::Recur', fqcn: 'P', method: 'Recur', layer: 'COMPONENT', project: 'p' }));
+    g.edges.push(edge('P::Recur', 'P::Recur', 'render'));
+    const h = checkGraph(g);
+    expect(h.orphans.ids).toContain('P::Recur');
+  });
+
   it('reports ok on a fully connected graph', () => {
     const g = graph();
     g.nodes = g.nodes.filter((n) => n.id !== 'P::Lonely');

@@ -75,7 +75,8 @@ function analyzeInProcess(repo: string, opts: Opts): IrFile[] {
 async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: number; repo: string }> {
   const repo = opts.flags['--repo'] ?? '../.repo';
   const splitOff = '--no-split' in opts.flags;
-  const requestedWorkers = opts.flags['--workers'] ? parseInt(opts.flags['--workers'], 10) : null;
+  const w = parseInt(opts.flags['--workers'] ?? '', 10);
+  const requestedWorkers = Number.isFinite(w) && w > 0 ? w : null; // ignore missing/NaN/<=0
 
   // Split a large repo/workspace into per-project-root child processes so each
   // giant ts.Program's memory is released after its worker exits. Only worth it

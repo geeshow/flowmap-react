@@ -25,7 +25,7 @@ export interface GraphHealth {
   danglingSample: string[];
   orphans: OrphanBreakdown;
   // softer connectivity signals (subset relationships with orphans possible)
-  componentsNeverRendered: number; // COMPONENT/SCREEN with no incoming render edge
+  componentsNeverRendered: number; // COMPONENT/HOOK with no incoming render/route edge
   screensWithoutRoute: number; // SCREEN with no route relation
   storesNeverReferenced: number; // STORE with no dispatch/read edge
   apiWithoutCaller: number; // API/EXTERNAL with no incoming edge
@@ -51,6 +51,7 @@ function degrees(graph: CallGraph): { deg: Map<string, Degree>; dangling: string
       dangling.push(`${e.source} -[${e.relation}]-> ${e.target}`);
       continue;
     }
+    if (e.source === e.target) continue; // a self-loop is not connectivity
     deg.get(e.source)!.out++;
     const t = deg.get(e.target)!;
     t.in++;
@@ -78,6 +79,7 @@ export function checkGraph(graph: CallGraph): GraphHealth {
   }
 
   const is = (n: MethodNode, ...ls: Layer[]) => ls.includes(n.layer);
+  const hasRenderIn = (d: Degree) => [...d.inByRelation].some((r) => RENDER_RELATIONS.has(r));
   let componentsNeverRendered = 0;
   let screensWithoutRoute = 0;
   let storesNeverReferenced = 0;
@@ -85,7 +87,7 @@ export function checkGraph(graph: CallGraph): GraphHealth {
   let unresolvedApi = 0;
   for (const n of graph.nodes) {
     const d = deg.get(n.id)!;
-    if (is(n, 'COMPONENT', 'HOOK') && d.in === 0) componentsNeverRendered++;
+    if (is(n, 'COMPONENT', 'HOOK') && !hasRenderIn(d)) componentsNeverRendered++;
     if (is(n, 'SCREEN') && !d.inByRelation.has('route')) screensWithoutRoute++;
     if (is(n, 'STORE') && d.in === 0) storesNeverReferenced++;
     if (is(n, 'API', 'EXTERNAL')) {

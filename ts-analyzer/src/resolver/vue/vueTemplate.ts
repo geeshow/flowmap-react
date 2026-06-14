@@ -5,9 +5,10 @@
  * (no API call / no dispatch) floats as an orphan node.
  *
  * Templates are usually Pug (`<template lang="pug">`) in real Nuxt 2 apps, with
- * plain HTML as a fallback. We extract leading tag tokens line-by-line (Pug) or
- * via tag scan (HTML), drop native HTML / framework builtins, and return the
- * component-candidate tags. Resolution to a component id is the caller's job.
+ * plain HTML as a fallback. We extract leading tag tokens line-by-line (Pug,
+ * indentation-aware so comment/literal-text blocks are skipped) or via a tag
+ * scan (HTML, with comments/attribute-strings blanked). Native HTML / framework
+ * builtins are dropped; resolution to a component id is the caller's job.
  */
 
 /** Native HTML + SVG + Vue/Nuxt framework tags that are never user components. */
@@ -28,9 +29,9 @@ const NATIVE_TAGS = new Set([
   'radialgradient', 'stop', 'tspan', 'iframe', 'embed', 'object', 'param', 'map', 'area',
   // misc inline
   'script', 'style', 'link', 'meta', 'title', 'base', 'noscript', 'template', 'slot', 'wbr', 'time', 'data', 'kbd',
-  'samp', 'var', 'del', 'ins', 'bdi', 'bdo', 'ruby', 'rt', 'rp', 'figcaption', 'picture',
+  'samp', 'var', 'del', 'ins', 'bdi', 'bdo', 'ruby', 'rt', 'rp',
   // Vue / Nuxt builtins (resolve to nothing user-defined)
-  'component', 'transition', 'transition-group', 'keep-alive', 'slot', 'teleport', 'suspense',
+  'component', 'transition', 'transition-group', 'keep-alive', 'teleport', 'suspense',
   'router-view', 'router-link', 'nuxt', 'nuxt-child', 'nuxt-link', 'client-only', 'no-ssr', 'nuxt-content',
 ]);
 
@@ -75,61 +76,105 @@ function parenDelta(s: string): number {
   return depth;
 }
 
+/** Split a Pug line into inline-nested segments on top-level `: ` (outside quotes/parens). */
+function inlineSegments(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let quote = '';
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+    } else if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    else if (depth === 0 && ch === ':' && s[i + 1] === ' ') {
+      out.push(s.slice(start, i));
+      start = i + 2;
+      i++;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
 /**
  * Extract component-candidate tags from a Pug template body.
  *
- * Pug attributes may span multiple lines inside `(...)`; we track paren depth so
- * continuation lines (`type="text"`, `v-if="..."`) are not mistaken for tags.
+ * Indentation-aware: `//`/`//-` comment blocks and trailing-dot literal text
+ * blocks (`p.`, `div.`) suppress their deeper-indented bodies. Multi-line
+ * attribute lists `(...)` are tracked so continuation lines aren't read as tags.
  */
 export function extractPugTags(pug: string): TemplateTag[] {
   const out: TemplateTag[] = [];
   const lines = stripWrapper(pug).split(/\r?\n/);
   let attrDepth = 0; // >0 while inside a multi-line attribute list
+  let blockIndent = -1; // >=0 while inside a comment/literal-text block of this indent
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
     if (attrDepth > 0) {
       attrDepth += parenDelta(raw);
-      continue; // still inside an open (...) attribute list — not a tag line
+      continue;
     }
-    const s = raw.replace(/^\s+/, '');
-    if (!s) continue;
+    const indent = raw.length - raw.replace(/^\s+/, '').length;
+    const s = raw.slice(indent);
+    if (!s) continue; // blank lines do not terminate a block
+    if (blockIndent >= 0) {
+      if (indent > blockIndent) continue; // still inside the comment/literal block
+      blockIndent = -1; // block ended — process this line normally
+    }
+    if (s.startsWith('//')) {
+      blockIndent = indent; // `//` and `//-` suppress the indented sub-tree
+      continue;
+    }
     const c0 = s[0];
-    // text / code / interpolation / piped text / comments / mixin-call / raw-html
     if (c0 === '|' || c0 === '=' || c0 === '-' || c0 === '+' || c0 === '.' || c0 === '#' || c0 === ':') {
       attrDepth += parenDelta(s);
       continue;
     }
-    if (s.startsWith('//')) continue;
     if (c0 === '<') {
-      // embedded raw HTML line inside Pug
       for (const t of scanHtmlTags(s)) out.push({ tag: t, line: i });
       continue;
     }
-    const m = s.match(/^([A-Za-z][\w-]*)/);
-    if (m) {
+    for (const seg of inlineSegments(s)) {
+      const m = seg.replace(/^\s+/, '').match(/^([A-Za-z][\w-]*)/);
+      if (!m) continue;
       const tag = m[1];
       if (!PUG_KEYWORDS.has(tag) && !isNative(tag)) out.push({ tag, line: i });
     }
-    // Carry any attribute paren opened on this line into the next.
-    attrDepth += parenDelta(s);
+    // A trailing dot (balanced parens) opens a literal text block.
+    if (parenDelta(s) === 0 && /\.\s*$/.test(s)) blockIndent = indent;
+    else attrDepth += parenDelta(s);
   }
   return out;
+}
+
+/** Blank quoted-string regions in a single line (keeps length/positions). */
+function blankQuotes(s: string): string {
+  return s.replace(/"[^"]*"|'[^']*'/g, (m) => ' '.repeat(m.length));
 }
 
 function scanHtmlTags(html: string): string[] {
   const out: string[] = [];
   const re = /<([A-Za-z][\w-]*)/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
+  const cleaned = blankQuotes(stripHtmlComments(html));
+  while ((m = re.exec(cleaned)) !== null) {
     const tag = m[1];
     if (!isNative(tag)) out.push(tag);
   }
   return out;
 }
 
+/** Replace HTML comment regions with same-length blanks, preserving newlines. */
+function stripHtmlComments(html: string): string {
+  return html.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
+}
+
 /** Extract component-candidate tags from an HTML template body. */
 export function extractHtmlTags(html: string): TemplateTag[] {
-  const body = stripWrapper(html);
+  const body = stripHtmlComments(stripWrapper(html));
   const lines = body.split(/\r?\n/);
   const out: TemplateTag[] = [];
   for (let i = 0; i < lines.length; i++) {
