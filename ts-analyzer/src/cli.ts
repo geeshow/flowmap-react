@@ -309,6 +309,23 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   const noSplit = '--no-split' in opts.flags || /^(1|true|yes)$/i.test(cfg.NO_SPLIT ?? '');
   const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
 
+  // `--only a,b` runs just those stages (reusing prior outputs for the rest).
+  // e.g. `--only join` re-runs join against the existing graph.json without
+  // re-analyzing. Default: all three stages.
+  const ALL_STEPS = ['analyze', 'screens', 'join'] as const;
+  const onlyRaw = pick('--only', 'ONLY');
+  const steps = new Set<string>(ALL_STEPS);
+  if (onlyRaw) {
+    const requested = onlyRaw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const bad = requested.filter((s) => !ALL_STEPS.includes(s as (typeof ALL_STEPS)[number]));
+    if (bad.length) {
+      process.stderr.write(`pipeline: unknown --only step(s): ${bad.join(', ')} (valid: ${ALL_STEPS.join(', ')})\n`);
+      process.exit(2);
+    }
+    steps.clear();
+    for (const s of requested) steps.add(s);
+  }
+
   fs.mkdirSync(outDir, { recursive: true });
   // Output file base: explicit NAME, else PROJECT, else "graph" (whole-repo run).
   const base = pick('--name', 'NAME') || project || 'graph';
@@ -325,24 +342,38 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   if (workers) common['--workers'] = workers;
   if (noSplit) common['--no-split'] = '';
 
-  // 0) refresh checkout
-  refreshRepo(path.resolve(repo), project, pull);
+  // 0) refresh checkout (only meaningful when analyze runs)
+  if (steps.has('analyze')) refreshRepo(path.resolve(repo), project, pull);
 
   // 1) analyze
-  process.stderr.write(`\n[1/3] analyze → ${graphOut}\n`);
-  await cmdAnalyze({ flags: { ...common, '--out': graphOut } });
+  if (steps.has('analyze')) {
+    process.stderr.write(`\n[1/3] analyze → ${graphOut}\n`);
+    await cmdAnalyze({ flags: { ...common, '--out': graphOut } });
+  } else {
+    process.stderr.write(`\n[1/3] analyze skipped (--only ${[...steps].join(',')})\n`);
+  }
 
   // 2) screens (no --workers/--no-split; screens has its own light path)
-  process.stderr.write(`\n[2/3] screens → ${screensOut}\n`);
-  const screensFlags: Record<string, string> = { '--repo': repo, '--out': screensOut };
-  if (project) screensFlags['--project'] = project;
-  cmdScreens({ flags: screensFlags });
+  if (steps.has('screens')) {
+    process.stderr.write(`\n[2/3] screens → ${screensOut}\n`);
+    const screensFlags: Record<string, string> = { '--repo': repo, '--out': screensOut };
+    if (project) screensFlags['--project'] = project;
+    cmdScreens({ flags: screensFlags });
+  } else {
+    process.stderr.write(`\n[2/3] screens skipped (--only ${[...steps].join(',')})\n`);
+  }
 
   // 3) join (skipped if no backend graph configured/present)
-  if (!backend) {
+  if (!steps.has('join')) {
+    process.stderr.write(`\n[3/3] join skipped (--only ${[...steps].join(',')})\n`);
+  } else if (!backend) {
     process.stderr.write(`\n[3/3] join skipped — set BACKEND in config (or --backend) to enable\n`);
   } else if (!fs.existsSync(backend)) {
     process.stderr.write(`\n[3/3] join skipped — backend graph not found: ${backend}\n`);
+  } else if (!fs.existsSync(graphOut)) {
+    // join reuses the analyze output; without it there is nothing to join.
+    process.stderr.write(`\n[3/3] join: front graph not found: ${graphOut} — run analyze first (drop --only)\n`);
+    process.exit(1);
   } else {
     process.stderr.write(`\n[3/3] join → ${joinOut}\n`);
     cmdJoin({ flags: { '--graph': graphOut, '--backend': backend, '--out': joinOut } });
@@ -430,7 +461,8 @@ function usage(): void {
   process.stderr.write(
     [
       'flowmap-react (TypeScript Compiler API)',
-      '  pipeline [--config flowmap.config]   # refresh repo → analyze → screens → join, options from config',
+      '  pipeline [--config flowmap.config] [--only analyze,screens,join]   # refresh repo → analyze → screens → join, options from config',
+      '          # --only join: re-run just join against the existing graph.json (no re-analyze)',
       '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--env-profile name] [--mode development|production]',
       '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
       '  join    --graph front.json --backend backend.json [--out join.json]',
