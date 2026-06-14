@@ -64,6 +64,18 @@ describe('e2e on sample-shop-react', () => {
     expect(list!.externalUrl).toBe('https://api.shop.com/account/v1/account-list');
   });
 
+  it('resolves a queryFn whose axios instance is factory-produced (homeAxios pattern)', () => {
+    // useHomeAccountListSuspenseQuery → accountListQueryOptions → object literal whose
+    // queryFn calls `homeAxios.get(...).then(...)`, where homeAxios = createHomeInstance()
+    // (a factory call, not a direct `axios.create(...)` initializer).
+    const list = httpNodes.find((n) => n.endpoint === '/account/v1/account-list');
+    expect(list).toBeTruthy();
+    const hook = byId('sample-shop-react/src/api/homeQuery.ts::useHomeAccountListSuspenseQuery');
+    expect(hook).toBeTruthy();
+    const edge = g.edges.find((e) => e.source === hook!.id && e.relation === 'http' && e.target === list!.id);
+    expect(edge).toBeTruthy();
+  });
+
   it('resolves a URL pulled from a local object destructure (const { url } = config)', () => {
     const terms = httpNodes.find((n) => n.endpoint === '/account/v1/service-terms');
     expect(terms).toBeTruthy();
