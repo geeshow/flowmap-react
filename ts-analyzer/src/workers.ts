@@ -72,6 +72,9 @@ export function planWorkers(roots: number, requested?: number | null): WorkerPla
     workers = Math.max(1, Math.min(workers, Math.floor(budgetMB / override) || 1));
   } else {
     perWorkerMB = Math.max(4096, Math.floor(budgetMB / workers));
+    // An explicit `requested` count can exceed the budget once perWorkerMB is
+    // floored at 4GB — cap concurrency so summed heaps still fit.
+    workers = Math.max(1, Math.min(workers, Math.floor(budgetMB / perWorkerMB) || 1));
   }
   return { workers, perWorkerMB };
 }

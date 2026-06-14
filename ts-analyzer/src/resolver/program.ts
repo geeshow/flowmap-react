@@ -97,8 +97,24 @@ export function isVueProject(rootDir: string): boolean {
   return collectSourceFiles(rootDir, ['.vue']).length > 0;
 }
 
+/** True if `dir`'s package.json declares any of `deps` (the dir IS a project). */
+function pkgDeclaresDep(dir: string, deps: string[]): boolean {
+  const pkgPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return false;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const all = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+    return deps.some((d) => all[d]);
+  } catch {
+    return false;
+  }
+}
+
 /** Discover Vue project roots directly under repoRoot. */
 export function discoverVueProjects(repoRoot: string, projectFilter?: string | null): string[] {
+  // repoRoot may itself BE a Vue project (`--repo .repo/my-nuxt-app`) — analyze it
+  // as one unit instead of fragmenting its components/, pages/, … into projects.
+  if (!projectFilter && pkgDeclaresDep(repoRoot, ['vue', 'nuxt'])) return [path.resolve(repoRoot)];
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(repoRoot, { withFileTypes: true });
@@ -128,6 +144,9 @@ export function isNextProject(rootDir: string): boolean {
 
 /** Discover project roots directly under repoRoot that are React projects. */
 export function discoverProjects(repoRoot: string, projectFilter?: string | null): string[] {
+  // repoRoot may itself BE a React project (`--repo .repo/my-app`) — analyze it
+  // as one unit instead of fragmenting its src/components, src/pages, … .
+  if (!projectFilter && pkgDeclaresDep(repoRoot, ['react', 'next'])) return [path.resolve(repoRoot)];
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(repoRoot, { withFileTypes: true });

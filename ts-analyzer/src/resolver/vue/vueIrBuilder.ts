@@ -154,8 +154,8 @@ export class VueResolver implements Resolver {
 
     // Pass 2: parse each template → render usages (parent → child edges).
     for (const r of comps) {
-      const localImports = this.localComponentImports(r.sf, r.real, projectRoot, realToId, vueReal);
-      const usages = this.renderUsages(r.real, r.comp.id, localImports, globalRegistry, nameIndex, fileIndex);
+      const local = this.localComponentImports(r.sf, r.real, projectRoot, realToId, vueReal);
+      const usages = this.renderUsages(r.real, r.comp.id, local.map, local.lazy, globalRegistry, nameIndex, fileIndex);
       if (r.isLayout) {
         for (const pageId of layoutChildren.get(r.comp.id) ?? []) {
           usages.push({ tagName: 'nuxt', targetComponentId: pageId, lazy: false, line: null });
@@ -186,8 +186,9 @@ export class VueResolver implements Resolver {
     projectRoot: string,
     realToId: Map<string, string>,
     vueReal: Set<string>,
-  ): Map<string, string> {
+  ): { map: Map<string, string>; lazy: Set<string> } {
     const out = new Map<string, string>();
+    const lazy = new Set<string>(); // tags registered via `() => import(...)`
     const imports = importMapOf(sf, real, projectRoot, realToId, vueReal);
     for (const [ident, id] of imports) out.set(tagKey(ident), id);
 
@@ -206,13 +207,16 @@ export class VueResolver implements Resolver {
           else {
             const spec = findDynamicImportPath(p.initializer);
             const resolved = spec && resolveVueSpecifier(spec, real, projectRoot, vueReal);
-            if (resolved) id = realToId.get(path.resolve(resolved));
+            if (resolved) {
+              id = realToId.get(path.resolve(resolved));
+              if (id) lazy.add(tagKey(key));
+            }
           }
           if (id) out.set(tagKey(key), id);
         }
       }
     }
-    return out;
+    return { map: out, lazy };
   }
 
   /** Scan all source files for `Vue.component(...)` global registrations. */
@@ -257,6 +261,7 @@ export class VueResolver implements Resolver {
     real: string,
     selfId: string,
     localImports: Map<string, string>,
+    lazyTags: Set<string>,
     globalRegistry: Map<string, string>,
     nameIndex: Map<string, Set<string>>,
     fileIndex: Map<string, Set<string>>,
@@ -284,10 +289,11 @@ export class VueResolver implements Resolver {
     for (const t of extractTemplateTags(blocks.templateContent, blocks.templateLang)) {
       const target = resolve(tagKey(t.tag));
       if (target === selfId) continue; // a component self-referencing its own tag — skip
-      const key = `${tagKey(t.tag)}::${target ?? ''}`; // collapse casing variants to one edge
+      const tk = tagKey(t.tag);
+      const key = `${tk}::${target ?? ''}`; // collapse casing variants to one edge
       if (seen.has(key)) continue; // one render edge per distinct child
       seen.add(key);
-      usages.push({ tagName: t.tag, targetComponentId: target, lazy: false, line: blocks.templateStartLine + t.line });
+      usages.push({ tagName: t.tag, targetComponentId: target, lazy: lazyTags.has(tk), line: blocks.templateStartLine + t.line });
     }
     return usages;
   }

@@ -60,7 +60,7 @@ function degrees(graph: CallGraph): { deg: Map<string, Degree>; dangling: string
   return { deg, dangling };
 }
 
-const RENDER_RELATIONS = new Set(['render', 'route']);
+const RENDER_RELATIONS = new Set(['render']); // graphBuilder render edge relation
 
 export function checkGraph(graph: CallGraph): GraphHealth {
   const { deg, dangling } = degrees(graph);
@@ -88,7 +88,8 @@ export function checkGraph(graph: CallGraph): GraphHealth {
   for (const n of graph.nodes) {
     const d = deg.get(n.id)!;
     if (is(n, 'COMPONENT', 'HOOK') && !hasRenderIn(d)) componentsNeverRendered++;
-    if (is(n, 'SCREEN') && !d.inByRelation.has('route')) screensWithoutRoute++;
+    // A SCREEN carries its route path in `endpoint` (graphBuilder emits no 'route' edge).
+    if (is(n, 'SCREEN') && n.endpoint == null) screensWithoutRoute++;
     if (is(n, 'STORE') && d.in === 0) storesNeverReferenced++;
     if (is(n, 'API', 'EXTERNAL')) {
       if (d.in === 0) apiWithoutCaller++;
