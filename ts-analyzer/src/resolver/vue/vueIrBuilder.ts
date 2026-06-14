@@ -7,17 +7,20 @@
  * Component render graph + Pug layout are Phase 2 (jsxUsages left empty here).
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
-import type { IrCall, IrComponent, IrFile, IrRoute, IrStore, Resolver, ResolveOptions } from '../../ir';
+import type { IrCall, IrComponent, IrFile, IrJsxUsage, IrRoute, IrStore, Resolver, ResolveOptions } from '../../ir';
 import { ConstantEvaluator } from '../constantEvaluator';
 import { AnalysisContext } from '../context';
 import { discoverVueProjects, provenance } from '../program';
 import { loadNuxtEnv, readAxiosBaseUrl } from './nuxtEnvResolver';
+import { splitSfc } from './sfc';
 import { VueApiCallResolver } from './vueApiCallResolver';
 import { VueBodyWalker, vuexModuleId } from './vueBodyWalker';
 import { buildVueProgram } from './vueProgram';
 import { isUnderPages, nuxtRoutePath, pagesDirOf } from './vueRouteResolver';
+import { extractTemplateTags, tagKey } from './vueTemplate';
 import { resolveVuexFile } from './vuexResolver';
 
 const LIFECYCLE = new Set([
@@ -53,8 +56,19 @@ export class VueResolver implements Resolver {
 
     const storeDir = path.join(projectRoot, 'store');
     const pagesDir = pagesDirOf(projectRoot);
+    const layoutsDir = path.join(projectRoot, 'layouts');
     const files: IrFile[] = [];
+    const comps: {
+      comp: IrComponent;
+      rel: string;
+      routes: IrRoute[];
+      real: string;
+      isPage: boolean;
+      isLayout: boolean;
+      layout: string | null; // declared `layout:` for a page (null → Nuxt 'default')
+    }[] = [];
 
+    // Pass 1: components/pages (jsxUsages filled in pass 2) + Vuex modules.
     for (const sf of pp.sourceFiles) {
       const real = realOf(sf.fileName);
 
@@ -71,8 +85,10 @@ export class VueResolver implements Resolver {
       if (real.endsWith('.vue')) {
         const comp = this.parseSfc(sf, ctx, walker);
         if (!comp) continue;
+        const isPage = isUnderPages(real, pagesDir);
+        const isLayout = within(real, layoutsDir);
         const routes: IrRoute[] = [];
-        if (isUnderPages(real, pagesDir)) {
+        if (isPage) {
           const rel = path.relative(pagesDir, real);
           routes.push({
             routePath: nuxtRoutePath(rel),
@@ -82,10 +98,96 @@ export class VueResolver implements Resolver {
             line: 1,
           });
         }
-        files.push(this.fileOf(ctx.repoRel(sf.fileName), repoRoot, [comp], [], routes));
+        const layout = isPage ? this.pageLayout(sf) : null;
+        comps.push({ comp, rel: ctx.repoRel(sf.fileName), routes, real, isPage, isLayout, layout });
       }
     }
+
+    // Two render-resolution indexes (cover both auto-import conventions):
+    //   nameIndex — by the SFC's `name:` (Nuxt path-prefixed: AboutSectionFirst)
+    //   fileIndex — by file basename (basename convention: <account-integration-btn>
+    //               for components/recover/AccountIntegrationBtn.vue named differently)
+    // nameIndex wins; fileIndex is the fallback. Ambiguous keys (>1) stay unresolved.
+    const nameIndex = new Map<string, Set<string>>();
+    const fileIndex = new Map<string, Set<string>>();
+    const add = (m: Map<string, Set<string>>, key: string, id: string) => {
+      let set = m.get(key);
+      if (!set) m.set(key, (set = new Set()));
+      set.add(id);
+    };
+    for (const r of comps) {
+      add(nameIndex, tagKey(r.comp.name), r.comp.id);
+      add(fileIndex, tagKey(path.basename(r.real, '.vue')), r.comp.id);
+    }
+
+    // Nuxt layouts host pages via `<nuxt/>`. Map each page to its layout
+    // (declared `layout:` or 'default') so the layout → page render edge connects
+    // otherwise-leaf pages (redirects, error pages) into the graph.
+    const layoutIndex = new Map<string, string>(); // tagKey(basename) → layout id
+    for (const r of comps) if (r.isLayout) layoutIndex.set(tagKey(path.basename(r.real, '.vue')), r.comp.id);
+    const layoutChildren = new Map<string, string[]>(); // layout id → page ids
+    for (const r of comps) {
+      if (!r.isPage) continue;
+      const lid = layoutIndex.get(tagKey(r.layout ?? 'default')) ?? layoutIndex.get(tagKey('default'));
+      if (lid && lid !== r.comp.id) {
+        let kids = layoutChildren.get(lid);
+        if (!kids) layoutChildren.set(lid, (kids = []));
+        kids.push(r.comp.id);
+      }
+    }
+
+    // Pass 2: parse each template → render usages (parent → child edges).
+    for (const r of comps) {
+      const usages = this.renderUsages(r.real, r.comp.id, nameIndex, fileIndex);
+      if (r.isLayout) {
+        for (const pageId of layoutChildren.get(r.comp.id) ?? []) {
+          usages.push({ tagName: 'nuxt', targetComponentId: pageId, lazy: false, line: null });
+        }
+      }
+      r.comp.jsxUsages = usages;
+      files.push(this.fileOf(r.rel, repoRoot, [r.comp], [], r.routes));
+    }
     return files;
+  }
+
+  /** Read a page SFC's `layout:` option (string form); null if absent/dynamic. */
+  private pageLayout(sf: ts.SourceFile): string | null {
+    const obj = findDefaultExportObject(sf);
+    return obj ? stringProp(obj, 'layout') : null;
+  }
+
+  /** Parse an SFC template (Pug/HTML) and resolve child tags to component ids. */
+  private renderUsages(
+    real: string,
+    selfId: string,
+    nameIndex: Map<string, Set<string>>,
+    fileIndex: Map<string, Set<string>>,
+  ): IrJsxUsage[] {
+    const resolve = (key: string): string | null => {
+      const byName = nameIndex.get(key);
+      if (byName && byName.size === 1) return [...byName][0];
+      const byFile = fileIndex.get(key);
+      if (byFile && byFile.size === 1) return [...byFile][0];
+      return null;
+    };
+    let blocks: ReturnType<typeof splitSfc>;
+    try {
+      blocks = splitSfc(fs.readFileSync(real, 'utf8'));
+    } catch {
+      return [];
+    }
+    if (!blocks.templateContent) return [];
+    const usages: IrJsxUsage[] = [];
+    const seen = new Set<string>();
+    for (const t of extractTemplateTags(blocks.templateContent, blocks.templateLang)) {
+      const target = resolve(tagKey(t.tag));
+      if (target === selfId) continue; // a component self-referencing its own tag — skip
+      const key = `${t.tag}::${target ?? ''}`;
+      if (seen.has(key)) continue; // one render edge per distinct child
+      seen.add(key);
+      usages.push({ tagName: t.tag, targetComponentId: target, lazy: false, line: blocks.templateStartLine + t.line });
+    }
+    return usages;
   }
 
   // ---- SFC (Options API) parsing ----

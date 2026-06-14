@@ -14,8 +14,7 @@ REPO=.repo
 NAME=graph
 
 # 결과 JSON을 모아둘 디렉터리 (없으면 자동 생성)
-OUT_DIR=/Users/rnd-20240067-ken/kakao/flowmap5/docs/web/data
-
+OUT_DIR=../docs/web/data
 # 백엔드 결합 그래프 (join 단계 입력). 없거나 파일이 없으면 join 은 건너뜁니다.
 BACKEND=${OUT_DIR}/_combined.json
 

@@ -15,6 +15,7 @@ import { GraphBuilder } from './graphBuilder';
 import { join as joinGraphs } from './join';
 import * as jsonOutput from './jsonOutput';
 import { CallGraph } from './model';
+import { checkGraph, formatHealth } from './doctor';
 import type { IrFile } from './ir';
 import { TsResolver } from './resolver/irBuilder';
 import { isReactProject, isVueProject } from './resolver/program';
@@ -323,6 +324,14 @@ function cmdScreens(opts: Opts): void {
   }
 }
 
+async function cmdDoctor(opts: Opts): Promise<void> {
+  const graph = await graphFromOpts(opts);
+  const health = checkGraph(graph);
+  process.stdout.write(formatHealth(health, { maxSample: parseInt(opts.flags['--sample'] ?? '15', 10) || 15 }) + '\n');
+  const maxOrphans = parseInt(opts.flags['--max-orphans'] ?? '0', 10) || 0;
+  if (health.danglingEdges > 0 || health.orphans.total > maxOrphans) process.exitCode = 1;
+}
+
 async function cmdStats(opts: Opts): Promise<void> {
   const graph = await graphFromOpts(opts);
   const layers = countBy(graph.nodes, (n) => n.layer);
@@ -356,6 +365,7 @@ function usage(): void {
       '  join    --graph front.json --backend backend.json [--out join.json]',
       '  search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]',
       '  stats   [--graph g.json | --repo <dir>]',
+      '  doctor  [--graph g.json | --repo <dir>] [--max-orphans N]   # graph health: orphans, dangling, connectivity',
       '  screens --repo <dir> [--project P] [--out f.json]   # screen layout/wireframe data',
       '',
     ].join('\n'),
@@ -380,7 +390,7 @@ async function main(): Promise<void> {
 
   // Workers (`__ir`) inherit a heap flag from the parent; only the user-facing
   // commands that build a ts.Program in-process need the heap guard.
-  if (['analyze', 'search', 'stats', 'screens', 'pipeline'].includes(cmd)) ensureHeap();
+  if (['analyze', 'search', 'stats', 'screens', 'pipeline', 'doctor'].includes(cmd)) ensureHeap();
 
   switch (cmd) {
     case 'analyze':
@@ -401,6 +411,9 @@ async function main(): Promise<void> {
       break;
     case 'stats':
       await cmdStats(opts);
+      break;
+    case 'doctor':
+      await cmdDoctor(opts);
       break;
     case 'screens':
       cmdScreens(opts);
