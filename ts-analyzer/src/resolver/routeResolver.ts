@@ -86,11 +86,28 @@ function componentFromAttrInitializer(init: ts.JsxAttributeValue, ctx: AnalysisC
   if (ts.isJsxExpression(init) && init.expression) {
     const expr = init.expression;
     if (ts.isJsxSelfClosingElement(expr) || ts.isJsxElement(expr)) {
-      const tag = ts.isJsxElement(expr) ? expr.openingElement.tagName : expr.tagName;
-      return ctx.resolveComponentRef(tag as ts.Expression);
+      return screenFromJsx(expr, ctx);
     }
     // Component={Comp}
     return ctx.resolveComponentRef(expr);
+  }
+  return { id: null, lazy: false };
+}
+
+/** Resolve a route element's screen component, descending through wrapper tags
+ *  (`<Suspense fallback={...}><Page/></Suspense>`, fragments) whose own tag does
+ *  not resolve to a project component. */
+function screenFromJsx(node: ts.JsxElement | ts.JsxSelfClosingElement, ctx: AnalysisContext): { id: string | null; lazy: boolean } {
+  const tag = ts.isJsxElement(node) ? node.openingElement.tagName : node.tagName;
+  const direct = ctx.resolveComponentRef(tag as ts.Expression);
+  if (direct.id) return direct;
+  if (ts.isJsxElement(node)) {
+    for (const child of node.children) {
+      if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child)) {
+        const inner = screenFromJsx(child, ctx);
+        if (inner.id) return inner;
+      }
+    }
   }
   return { id: null, lazy: false };
 }
@@ -114,14 +131,17 @@ function collectObjectRoutes(
       if (key === 'element') {
         const e = p.initializer;
         if (ts.isJsxSelfClosingElement(e) || ts.isJsxElement(e)) {
-          const tag = ts.isJsxElement(e) ? e.openingElement.tagName : e.tagName;
-          comp = ctx.resolveComponentRef(tag as ts.Expression);
+          comp = screenFromJsx(e, ctx);
         }
       }
       if ((key === 'Component' || key === 'component') && ts.isIdentifier(p.initializer)) {
         comp = ctx.resolveComponentRef(p.initializer);
       }
-      if (key === 'lazy') comp = { id: comp?.id ?? null, lazy: true };
+      if (key === 'lazy') {
+        // lazy: () => import('./Page') → resolve the module's Component/default export.
+        const lazyId = ctx.resolveRouteLazyModule(p.initializer);
+        comp = { id: lazyId ?? comp?.id ?? null, lazy: true };
+      }
       if ((key === 'loader' || key === 'action') && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer))) {
         routeFns.push(p.initializer);
       }

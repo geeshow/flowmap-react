@@ -11,6 +11,12 @@ export const AXIOS_MODULES = new Set(['axios']);
 /** SWR read-hook modules — `useSWR(key, fetcher)` treats `key` as the GET URL. */
 export const SWR_QUERY_MODULES = new Set(['swr', 'swr/immutable', 'swr/infinite']);
 
+/** SWR mutation module — `useSWRMutation(key, fetcher)`; `key` is the URL, write (POST). */
+export const SWR_MUTATION_MODULES = new Set(['swr/mutation']);
+
+/** graphql-request: `request(url, query)` and `new GraphQLClient(url).request(query)` (POST). */
+export const GRAPHQL_REQUEST_MODULES = new Set(['graphql-request']);
+
 /** Other HTTP clients with the same `client.verb(url)` / `client(url, {method})` shape. */
 export const HTTP_CLIENT_MODULES = new Set(['ky', 'got', 'superagent']);
 
@@ -29,6 +35,23 @@ export const REDUX_SLICE_FN = 'createSlice';
 export const REDUX_ASYNC_THUNK_FN = 'createAsyncThunk';
 export const ZUSTAND_CREATE_FNS = new Set(['create', 'createStore']);
 export const CONTEXT_CREATE_FN = 'createContext';
+
+/** Jotai atom factories + read/write hooks. */
+export const JOTAI_MODULES = new Set(['jotai', 'jotai/utils', 'jotai/vanilla']);
+export const JOTAI_ATOM_FNS = new Set(['atom', 'atomWithStorage', 'atomWithDefault', 'atomWithReset', 'atomFamily']);
+export const JOTAI_HOOKS = new Set(['useAtom', 'useAtomValue', 'useSetAtom']);
+
+/** Recoil atom/selector factories + read/write hooks. */
+export const RECOIL_MODULES = new Set(['recoil']);
+export const RECOIL_ATOM_FNS = new Set(['atom', 'atomFamily', 'selector', 'selectorFamily']);
+export const RECOIL_HOOKS = new Set([
+  'useRecoilState',
+  'useRecoilValue',
+  'useSetRecoilState',
+  'useResetRecoilState',
+  'useRecoilValueLoadable',
+  'useRecoilStateLoadable',
+]);
 
 /** Redux store hooks. */
 export const REDUX_HOOKS = new Set(['useSelector', 'useDispatch', 'useStore']);

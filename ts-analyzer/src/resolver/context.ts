@@ -88,9 +88,64 @@ export class AnalysisContext {
     if (ts.isVariableDeclaration(decl) && decl.initializer) {
       const lazyId = this.resolveLazyInitializer(decl.initializer, decl);
       if (lazyId) return { id: lazyId, lazy: true };
+      // const X = withAuth(Inner) — HOC-wrapped component.
+      const hoc = this.resolveHocComponent(decl.initializer);
+      if (hoc) return { id: hoc, lazy: false };
+    }
+    // export default withAuth(Inner) / export default memo(forwardRef(Inner))
+    if (ts.isExportAssignment(decl) && ts.isCallExpression(decl.expression)) {
+      const hoc = this.resolveHocComponent(decl.expression);
+      if (hoc) return { id: hoc, lazy: false };
     }
     const id = this.idOfDecl(decl);
     return { id, lazy: false };
+  }
+
+  /** Unwrap a HOC call (`withAuth(Page)`, `memo(forwardRef(Page))`, `connect(...)(Page)`)
+   *  to the id of the inner component argument. Recurses through nested calls. */
+  private resolveHocComponent(expr: ts.Expression): string | null {
+    if (!ts.isCallExpression(expr)) return null;
+    for (const arg of expr.arguments) {
+      if (ts.isCallExpression(arg)) {
+        const nested = this.resolveHocComponent(arg);
+        if (nested) return nested;
+      }
+      // Only a PascalCase identifier is treated as the wrapped component (skips
+      // config args like mapStateToProps).
+      if (ts.isIdentifier(arg) && isComponentName(arg.text)) {
+        const r = this.resolveComponentRef(arg);
+        if (r.id) return r.id;
+      }
+    }
+    return null;
+  }
+
+  /** react-router `lazy: () => import('./Page')` — the module's `Component` (named) or
+   *  default export becomes the screen component id. */
+  resolveRouteLazyModule(fn: ts.Expression): string | null {
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return null;
+    const spec = this.dynamicImportSpec(fn);
+    if (!spec) return null;
+    const target = this.resolveModuleFile(spec, fn.getSourceFile().fileName);
+    if (!target) return null;
+    // react-router lazy convention exports a named `Component`; fall back to default.
+    for (const stmt of target.statements) {
+      if (!this.hasExportModifier(stmt)) continue;
+      if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === 'Component') {
+        return `${this.repoRel(target.fileName)}::Component`;
+      }
+      if (ts.isVariableStatement(stmt)) {
+        for (const d of stmt.declarationList.declarations) {
+          if (ts.isIdentifier(d.name) && d.name.text === 'Component') return `${this.repoRel(target.fileName)}::Component`;
+        }
+      }
+    }
+    const def = this.defaultExportComponentName(target);
+    return def ? `${this.repoRel(target.fileName)}::${def}` : null;
+  }
+
+  private hasExportModifier(stmt: ts.Statement): boolean {
+    return !!(ts.canHaveModifiers(stmt) && ts.getModifiers(stmt)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword));
   }
 
   private resolveLazyInitializer(init: ts.Expression, decl: ts.VariableDeclaration): string | null {

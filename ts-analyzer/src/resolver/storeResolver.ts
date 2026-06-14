@@ -11,6 +11,10 @@
 import * as ts from 'typescript';
 import {
   CONTEXT_CREATE_FN,
+  JOTAI_ATOM_FNS,
+  JOTAI_MODULES,
+  RECOIL_ATOM_FNS,
+  RECOIL_MODULES,
   REDUX_ASYNC_THUNK_FN,
   REDUX_SLICE_FN,
   ZUSTAND_CREATE_FNS,
@@ -65,6 +69,10 @@ export function collectStores(sf: ts.SourceFile, ctx: AnalysisContext, acc: Stor
         handleThunk(decl, init, varName, ctx, acc, sf);
       } else if (ZUSTAND_CREATE_FNS.has(head.name) && isFrom(mod, 'zustand')) {
         handleZustand(decl, init, varName, ctx, acc, sf);
+      } else if (JOTAI_ATOM_FNS.has(head.name) && isFromAny(mod, JOTAI_MODULES)) {
+        handleAtomStore(decl, varName, ctx, acc, sf, 'jotai');
+      } else if (RECOIL_ATOM_FNS.has(head.name) && isFromAny(mod, RECOIL_MODULES)) {
+        handleAtomStore(decl, varName, ctx, acc, sf, 'recoil');
       } else if (head.name === CONTEXT_CREATE_FN && isFrom(mod, 'react')) {
         handleContext(decl, varName, ctx, acc, sf);
       }
@@ -175,6 +183,26 @@ function handleZustand(
   if (sym) acc.bindings.bySymbol.set(sym, storeId);
 }
 
+/**
+ * Jotai `atom(...)` / Recoil `atom({...})` declarations become STORE nodes keyed
+ * by the variable symbol, so a component using `useAtom(x)` / `useRecoilState(x)`
+ * resolves to the same id. Both libraries use the `atom` factory; the import
+ * module disambiguates jotai from recoil.
+ */
+function handleAtomStore(
+  decl: ts.VariableDeclaration,
+  varName: string,
+  ctx: AnalysisContext,
+  acc: StoreAccumulator,
+  sf: ts.SourceFile,
+  kind: 'jotai' | 'recoil',
+): void {
+  const storeId = `store:${kind}:${varName}`;
+  pushStore(acc, ctx, sf, { storeId, name: varName, kind, actions: [], line: lineOf(sf, decl) });
+  const sym = ctx.symbolAt(decl.name);
+  if (sym) acc.bindings.bySymbol.set(sym, storeId);
+}
+
 function handleContext(
   decl: ts.VariableDeclaration,
   varName: string,
@@ -226,6 +254,10 @@ function headCallee(expr: ts.Expression): { name: string; idNode: ts.Node } | nu
 
 function isFrom(mod: string | null, expected: string): boolean {
   return mod === expected;
+}
+
+function isFromAny(mod: string | null, expected: Set<string>): boolean {
+  return mod != null && expected.has(mod);
 }
 
 function firstObjectArg(init: ts.Expression): ts.ObjectLiteralExpression | undefined {

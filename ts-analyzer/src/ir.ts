@@ -8,7 +8,7 @@
 import type { Confidence } from './model';
 
 export type ComponentKind = 'component' | 'hook' | 'function' | 'action';
-export type StoreKind = 'redux-slice' | 'zustand' | 'context' | 'vuex';
+export type StoreKind = 'redux-slice' | 'zustand' | 'context' | 'vuex' | 'jotai' | 'recoil';
 export type RouteSource = 'react-router' | 'next-pages' | 'next-app' | 'nuxt-pages';
 
 /** A use of a child component in JSX (`<UserCard/>`). */

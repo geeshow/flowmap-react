@@ -12,7 +12,7 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { REDUX_HOOKS, isComponentName, isHookName } from '../classify';
+import { JOTAI_HOOKS, RECOIL_HOOKS, REDUX_HOOKS, isComponentName, isHookName } from '../classify';
 import type {
   ComponentKind,
   IrCall,
@@ -336,6 +336,16 @@ class BodyWalker {
         if (arg && ts.isIdentifier(arg)) {
           const csym = this.ctx.symbolAt(arg);
           const storeId = csym ? this.stores.bindings.bySymbol.get(csym) : undefined;
+          if (storeId) return { kind: 'storeRead', storeId, selector: null };
+        }
+        return null;
+      }
+      // jotai useAtom(x) / recoil useRecoilState(x) — the atom is the first arg.
+      if (JOTAI_HOOKS.has(callee.text) || RECOIL_HOOKS.has(callee.text)) {
+        const arg = node.arguments[0];
+        if (arg && ts.isIdentifier(arg)) {
+          const asym = this.ctx.symbolAt(arg);
+          const storeId = asym ? this.stores.bindings.bySymbol.get(asym) : undefined;
           if (storeId) return { kind: 'storeRead', storeId, selector: null };
         }
         return null;

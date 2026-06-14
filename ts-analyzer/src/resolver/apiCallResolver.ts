@@ -13,7 +13,17 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, HTTP_CLIENT_MODULES, SWR_QUERY_MODULES, isComponentName, isHookName } from '../classify';
+import {
+  AXIOS_MODULES,
+  AXIOS_REQUEST_METHODS,
+  AXIOS_VERB_METHODS,
+  GRAPHQL_REQUEST_MODULES,
+  HTTP_CLIENT_MODULES,
+  SWR_MUTATION_MODULES,
+  SWR_QUERY_MODULES,
+  isComponentName,
+  isHookName,
+} from '../classify';
 import type { ApiResolution } from '../ir';
 import type { Confidence } from '../model';
 import { normalize } from '../norm';
@@ -70,14 +80,18 @@ export class ApiCallResolver {
   protected classifyHttpCall(call: ts.CallExpression): RawHttp | null {
     const callee = call.expression;
 
-    // fetch(url, opts)
+    // fetch(url, opts) — also fetch(new Request(url, { method }))
     if (ts.isIdentifier(callee) && callee.text === 'fetch' && this.isGlobalFetch(callee)) {
-      const opts = call.arguments[1];
-      const m = this.methodFromConfig(opts);
+      let urlExpr = call.arguments[0];
+      let m = this.methodFromConfig(call.arguments[1]);
+      if (urlExpr && ts.isNewExpression(urlExpr) && ts.isIdentifier(urlExpr.expression) && urlExpr.expression.text === 'Request') {
+        if (m == null) m = this.methodFromConfig(urlExpr.arguments?.[1]); // verb lives inside the Request init
+        if (urlExpr.arguments?.[0]) urlExpr = urlExpr.arguments[0];
+      }
       return {
         method: m ?? 'GET',
         verbConfident: m != null,
-        urlExpr: call.arguments[0],
+        urlExpr,
         service: 'fetch',
         instanceBaseUrl: null,
         clientPackage: null,
@@ -112,12 +126,36 @@ export class ApiCallResolver {
           clientPackage: null,
         };
       }
+      // useSWRMutation(key, fetcher) — key is the URL, a write. The verb defaults to
+      // POST (SWR mutations are writes) unless the fetcher's inner call says otherwise.
+      if (mod && SWR_MUTATION_MODULES.has(mod)) {
+        const fetcherVerb = this.fetcherVerb(call.arguments[1]);
+        return {
+          method: fetcherVerb ?? 'POST',
+          verbConfident: fetcherVerb != null,
+          urlExpr: this.swrKeyExpr(call.arguments[0]),
+          service: 'swr-mutation',
+          instanceBaseUrl: null,
+          clientPackage: null,
+        };
+      }
+      // graphql-request: request(url, query) — a POST to the GraphQL endpoint.
+      if (callee.text === 'request' && mod && GRAPHQL_REQUEST_MODULES.has(mod)) {
+        return { method: 'POST', verbConfident: true, urlExpr: call.arguments[0], service: 'graphql-request', instanceBaseUrl: null, clientPackage: null };
+      }
     }
 
     // recv.method(...)
     if (ts.isPropertyAccessExpression(callee)) {
       const method = callee.name.text;
       const recv = callee.expression;
+      // graphql-request: const c = new GraphQLClient(url); c.request(query) — POST to the endpoint.
+      if (method === 'request') {
+        const gqlBase = this.graphqlClientBaseUrl(recv);
+        if (gqlBase) {
+          return { method: 'POST', verbConfident: true, urlExpr: undefined, service: 'graphql-request', instanceBaseUrl: gqlBase, clientPackage: null };
+        }
+      }
       // ky/got/superagent: client.get/post(url) (verb chains like .send() wrap this inner call)
       const client = this.httpClientName(recv);
       if (client && AXIOS_VERB_METHODS.has(method)) {
@@ -143,6 +181,26 @@ export class ApiCallResolver {
       return null;
     }
 
+    // axios[method](url) / instance[method](url) — dynamic verb. The verb is computed,
+    // so resolve it if it's a constant; otherwise emit the endpoint with an unknown verb.
+    if (ts.isElementAccessExpression(callee)) {
+      const recv = callee.expression;
+      const recvIsAxios = this.isAxiosImport(recv);
+      const inst = recvIsAxios ? { name: 'axios', baseUrl: null, clientPackage: null } : this.axiosInstanceInfo(recv);
+      if (inst && callee.argumentExpression) {
+        const mv = this.constEval.evalString(callee.argumentExpression);
+        const verb = mv.value && AXIOS_VERB_METHODS.has(mv.value.toLowerCase()) ? mv.value.toUpperCase() : null;
+        return {
+          method: verb,
+          verbConfident: verb != null,
+          urlExpr: call.arguments[0],
+          service: inst.name ?? 'axios',
+          instanceBaseUrl: inst.baseUrl,
+          clientPackage: inst.clientPackage,
+        };
+      }
+    }
+
     // instance(config) — callable axios instance
     if (ts.isIdentifier(callee)) {
       const inst = this.axiosInstanceInfo(callee);
@@ -150,6 +208,34 @@ export class ApiCallResolver {
     }
 
     return null;
+  }
+
+  /** Verb of an SWR-mutation fetcher: the method of the first HTTP call in its body. */
+  private fetcherVerb(fetcher: ts.Expression | undefined): string | null {
+    if (!fetcher) return null;
+    let body: ts.Node | undefined;
+    if (ts.isArrowFunction(fetcher) || ts.isFunctionExpression(fetcher)) body = fetcher.body;
+    else {
+      const decl = this.functionDeclOf(fetcher); // named fetcher (createUser)
+      body = decl?.body;
+    }
+    if (!body) return null;
+    const inner = this.findInnerHttpCall(body);
+    return inner && inner.raw.verbConfident ? inner.raw.method : null;
+  }
+
+  /** baseUrl of `const c = new GraphQLClient(url)` (graphql-request), or null. */
+  private graphqlClientBaseUrl(node: ts.Expression): EvalString | null {
+    if (!ts.isIdentifier(node)) return null;
+    const sym = this.checker.getSymbolAtLocation(node);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer || !ts.isNewExpression(decl.initializer)) return null;
+    const ne = decl.initializer;
+    if (!ts.isIdentifier(ne.expression) || ne.expression.text !== 'GraphQLClient') return null;
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(ne.expression));
+    if (!mod || !GRAPHQL_REQUEST_MODULES.has(mod)) return null;
+    const urlArg = ne.arguments?.[0];
+    return urlArg ? this.constEval.evalString(urlArg) : null;
   }
 
   /** axios({ method, url }) / instance.request({ method, url }) form. */
