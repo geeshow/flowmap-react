@@ -123,10 +123,13 @@ export function discoverProjectRoots(repoRoot: string, filter?: string | null): 
   const root = path.resolve(repoRoot);
 
   // repoRoot is itself an app/workspace → collect it directly (no child scan).
+  // A `--project` filter then selects by basename (the app itself, or a member).
   if (pkgKind(root) !== null) {
     const roots = new Set<string>();
     collect(root, 0, roots);
-    return [...roots].sort();
+    let list = [...roots];
+    if (filter) list = list.filter((r) => path.basename(r) === filter);
+    return list.sort();
   }
 
   let entries: fs.Dirent[];

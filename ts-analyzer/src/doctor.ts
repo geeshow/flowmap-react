@@ -24,6 +24,7 @@ export interface GraphHealth {
   danglingEdges: number; // edges referencing a missing node (sorted sample in `danglingSample`)
   danglingSample: string[];
   orphans: OrphanBreakdown;
+  leafScreens: number; // routed SCREEN nodes with no edges — legitimate entry points, not orphans
   // softer connectivity signals (subset relationships with orphans possible)
   componentsNeverRendered: number; // COMPONENT/HOOK with no incoming render/route edge
   screensWithoutRoute: number; // SCREEN with no route relation
@@ -66,9 +67,19 @@ export function checkGraph(graph: CallGraph): GraphHealth {
   const { deg, dangling } = degrees(graph);
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
 
-  const orphanNodes = graph.nodes.filter((n) => {
+  // A routed SCREEN with no edges is a legitimate entry point (a trivial page),
+  // not a disconnected orphan — count those separately as leaf screens.
+  const disconnected = graph.nodes.filter((n) => {
     const d = deg.get(n.id)!;
     return d.in === 0 && d.out === 0;
+  });
+  let leafScreens = 0;
+  const orphanNodes = disconnected.filter((n) => {
+    if (n.layer === 'SCREEN' && n.endpoint != null) {
+      leafScreens++;
+      return false;
+    }
+    return true;
   });
   const byLayer: Record<string, number> = {};
   const byProject: Record<string, number> = {};
@@ -108,6 +119,7 @@ export function checkGraph(graph: CallGraph): GraphHealth {
       byProject,
       ids: orphanNodes.map((n) => n.id).sort(),
     },
+    leafScreens,
     componentsNeverRendered,
     screensWithoutRoute,
     storesNeverReferenced,
@@ -122,7 +134,7 @@ export function formatHealth(h: GraphHealth, opts: { maxSample?: number; orphanI
   const max = opts.maxSample ?? 10;
   const lines: string[] = [];
   lines.push(`nodes: ${h.nodes}   edges: ${h.edges}   dangling: ${h.danglingEdges}`);
-  lines.push(`orphans: ${h.orphans.total}   by layer: ${JSON.stringify(h.orphans.byLayer)}`);
+  lines.push(`orphans: ${h.orphans.total}   by layer: ${JSON.stringify(h.orphans.byLayer)}   leaf-screens: ${h.leafScreens}`);
   if (Object.keys(h.orphans.byProject).length > 1) lines.push(`         by project: ${JSON.stringify(h.orphans.byProject)}`);
   lines.push(
     `connectivity: components-never-rendered=${h.componentsNeverRendered}` +

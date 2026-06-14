@@ -97,14 +97,21 @@ export function isVueProject(rootDir: string): boolean {
   return collectSourceFiles(rootDir, ['.vue']).length > 0;
 }
 
-/** True if `dir`'s package.json declares any of `deps` (the dir IS a project). */
-function pkgDeclaresDep(dir: string, deps: string[]): boolean {
-  const pkgPath = path.join(dir, 'package.json');
+/**
+ * True if `repoRoot` should be analyzed AS the single project (it declares a
+ * framework dep, is NOT a monorepo workspace root, and any `--project` filter
+ * matches its own basename). Workspaces are left to the split path, which
+ * fragments them into member packages.
+ */
+function isSelfProject(repoRoot: string, deps: string[], projectFilter?: string | null): boolean {
+  const pkgPath = path.join(repoRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return false;
   try {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    if (pkg.workspaces) return false; // monorepo root → split into members instead
     const all = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
-    return deps.some((d) => all[d]);
+    if (!deps.some((d) => all[d])) return false;
+    return !projectFilter || projectFilter === path.basename(path.resolve(repoRoot));
   } catch {
     return false;
   }
@@ -114,7 +121,7 @@ function pkgDeclaresDep(dir: string, deps: string[]): boolean {
 export function discoverVueProjects(repoRoot: string, projectFilter?: string | null): string[] {
   // repoRoot may itself BE a Vue project (`--repo .repo/my-nuxt-app`) — analyze it
   // as one unit instead of fragmenting its components/, pages/, … into projects.
-  if (!projectFilter && pkgDeclaresDep(repoRoot, ['vue', 'nuxt'])) return [path.resolve(repoRoot)];
+  if (isSelfProject(repoRoot, ['vue', 'nuxt'], projectFilter)) return [path.resolve(repoRoot)];
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(repoRoot, { withFileTypes: true });
@@ -146,7 +153,7 @@ export function isNextProject(rootDir: string): boolean {
 export function discoverProjects(repoRoot: string, projectFilter?: string | null): string[] {
   // repoRoot may itself BE a React project (`--repo .repo/my-app`) — analyze it
   // as one unit instead of fragmenting its src/components, src/pages, … .
-  if (!projectFilter && pkgDeclaresDep(repoRoot, ['react', 'next'])) return [path.resolve(repoRoot)];
+  if (isSelfProject(repoRoot, ['react', 'next'], projectFilter)) return [path.resolve(repoRoot)];
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(repoRoot, { withFileTypes: true });

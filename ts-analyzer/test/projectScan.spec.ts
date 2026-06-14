@@ -28,4 +28,10 @@ describe('discoverProjectRoots', () => {
     const roots = discoverProjectRoots(path.join(REPO, 'shopflow-web'));
     expect(roots).toEqual([path.join(REPO, 'shopflow-web')]);
   });
+
+  it('honors a filter matching the single-app-dir basename', () => {
+    const dir = path.join(REPO, 'sample-shop-react');
+    expect(discoverProjectRoots(dir, 'sample-shop-react')).toEqual([dir]);
+    expect(discoverProjectRoots(dir, 'nope')).toEqual([]);
+  });
 });

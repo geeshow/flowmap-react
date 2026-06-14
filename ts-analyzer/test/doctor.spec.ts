@@ -55,6 +55,17 @@ describe('doctor / checkGraph', () => {
     expect(h.orphans.ids).toContain('P::Recur');
   });
 
+  it('classifies a routed leaf SCREEN as a leaf-screen, not an orphan', () => {
+    const g = graph();
+    g.nodes.push(makeNode({ id: 'P::Report', fqcn: 'P', method: 'Report', layer: 'SCREEN', project: 'p', endpoint: '/report' }));
+    const h = checkGraph(g);
+    expect(h.leafScreens).toBe(1);
+    expect(h.orphans.ids).not.toContain('P::Report'); // routed entry point, not an orphan
+    // a SCREEN with NO route (endpoint null) is still an orphan
+    g.nodes.push(makeNode({ id: 'P::Floating', fqcn: 'P', method: 'Floating', layer: 'SCREEN', project: 'p' }));
+    expect(checkGraph(g).orphans.ids).toContain('P::Floating');
+  });
+
   it('reports ok on a fully connected graph', () => {
     const g = graph();
     g.nodes = g.nodes.filter((n) => n.id !== 'P::Lonely');
