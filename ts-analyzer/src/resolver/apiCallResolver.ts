@@ -890,21 +890,65 @@ export class ApiCallResolver {
     return info;
   }
 
-  /** The `axios.create(...)` call backing a declaration, whether a `const` or `export default`. */
-  private axiosCreateInitOf(decl: ts.Node | undefined): ts.CallExpression | null {
-    if (!decl) return null;
+  /** The `axios.create(...)` call backing a declaration: a direct initializer
+   *  (`const x = axios.create()` / `export default axios.create()`), a factory call
+   *  whose body returns one (`const homeAxios = createInstance()`), or an identifier
+   *  aliasing another instance (`export const homeAxios = baseInstance`). */
+  private axiosCreateInitOf(decl: ts.Node | undefined, depth = 0): ts.CallExpression | null {
+    if (!decl || depth > 4) return null;
     let expr: ts.Expression | undefined;
     if (ts.isVariableDeclaration(decl) || ts.isPropertyDeclaration(decl)) expr = decl.initializer;
     else if (ts.isExportAssignment(decl)) expr = decl.expression;
-    if (!expr || !ts.isCallExpression(expr)) return null;
-    if (
-      ts.isPropertyAccessExpression(expr.expression) &&
-      expr.expression.name.text === 'create' &&
-      this.isAxiosImport(expr.expression.expression)
-    ) {
-      return expr;
+    return expr ? this.axiosCreateFromExpr(expr, depth) : null;
+  }
+
+  private axiosCreateFromExpr(expr: ts.Expression, depth: number): ts.CallExpression | null {
+    if (depth > 4) return null;
+    if (ts.isCallExpression(expr)) {
+      if (this.isAxiosCreateCall(expr)) return expr;
+      // Factory: `const homeAxios = createInstance()` — a project-local function that
+      // configures and returns `axios.create(...)`. Trace into its body for the call.
+      const fn = this.functionDeclOf(expr.expression);
+      const body = fn && this.isProjectNode(fn) ? (fn as ts.FunctionLikeDeclaration).body : undefined;
+      return body ? this.findAxiosCreate(body) : null;
+    }
+    // Alias: `export const homeAxios = baseInstance` → follow to the backing decl.
+    if (ts.isIdentifier(expr)) {
+      let sym = this.checker.getSymbolAtLocation(expr);
+      if (sym && sym.flags & ts.SymbolFlags.Alias) {
+        try {
+          sym = this.checker.getAliasedSymbol(sym);
+        } catch {
+          /* not an alias */
+        }
+      }
+      const target = sym?.valueDeclaration ?? sym?.declarations?.[0];
+      if (target) return this.axiosCreateInitOf(target, depth + 1);
     }
     return null;
+  }
+
+  private isAxiosCreateCall(call: ts.CallExpression): boolean {
+    return (
+      ts.isPropertyAccessExpression(call.expression) &&
+      call.expression.name.text === 'create' &&
+      this.isAxiosImport(call.expression.expression)
+    );
+  }
+
+  /** First `axios.create(...)` call inside a function body (depth-first). */
+  private findAxiosCreate(body: ts.Node): ts.CallExpression | null {
+    let found: ts.CallExpression | null = null;
+    const visit = (node: ts.Node) => {
+      if (found) return;
+      if (ts.isCallExpression(node) && this.isAxiosCreateCall(node)) {
+        found = node;
+        return;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(body);
+    return found;
   }
 
   private functionDeclOf(callee: ts.Expression): ts.FunctionLikeDeclaration | null {
