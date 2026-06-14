@@ -178,6 +178,143 @@ function readTsconfigOptions(rootDir: string): ts.CompilerOptions {
   return parsed.options ?? {};
 }
 
+// ---- monorepo / pnpm-turbo workspace resolution ----
+
+interface PkgJson {
+  name?: string;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  workspaces?: string[] | { packages?: string[] };
+}
+
+function readPkgJson(dir: string): PkgJson | null {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as PkgJson;
+  } catch {
+    return null;
+  }
+}
+
+/** Nearest ancestor (incl. self) that is a workspace root: pnpm-workspace.yaml or a
+ *  package.json `workspaces` field. */
+function findWorkspaceRoot(startDir: string): string | null {
+  let dir = startDir;
+  for (let i = 0; i < 10; i++) {
+    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) return dir;
+    if (readPkgJson(dir)?.workspaces) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/** Member globs of a workspace (pnpm-workspace.yaml first, then package.json workspaces). */
+function workspaceMemberGlobs(wsRoot: string): string[] {
+  const pnpm = path.join(wsRoot, 'pnpm-workspace.yaml');
+  if (fs.existsSync(pnpm)) {
+    try {
+      return parsePnpmPackages(fs.readFileSync(pnpm, 'utf8'));
+    } catch {
+      /* fall through */
+    }
+  }
+  const ws = readPkgJson(wsRoot)?.workspaces;
+  return Array.isArray(ws) ? ws : ws?.packages ?? [];
+}
+
+/** Minimal pnpm-workspace.yaml `packages:` list parser (no YAML dep). Skips `!` negations. */
+function parsePnpmPackages(text: string): string[] {
+  const out: string[] = [];
+  let inList = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '');
+    if (/^packages\s*:/.test(line)) {
+      inList = true;
+      continue;
+    }
+    if (!inList) continue;
+    const m = line.match(/^\s*-\s*['"]?([^'"]+?)['"]?\s*$/);
+    if (m) {
+      const g = m[1].trim();
+      if (!g.startsWith('!')) out.push(g);
+    } else if (/^\S/.test(line)) break; // dedent to next top-level key
+  }
+  return out;
+}
+
+/** package name → absolute dir for every workspace member. */
+function workspacePackageRegistry(wsRoot: string): Map<string, string> {
+  const reg = new Map<string, string>();
+  for (const glob of workspaceMemberGlobs(wsRoot)) {
+    const star = glob.indexOf('*');
+    const dirs: string[] = [];
+    if (star === -1) {
+      const abs = path.resolve(wsRoot, glob);
+      if (fs.existsSync(path.join(abs, 'package.json'))) dirs.push(abs);
+    } else {
+      const base = path.resolve(wsRoot, glob.slice(0, star).replace(/\/$/, ''));
+      try {
+        for (const e of fs.readdirSync(base, { withFileTypes: true })) {
+          if (e.isDirectory() && fs.existsSync(path.join(base, e.name, 'package.json'))) dirs.push(path.join(base, e.name));
+        }
+      } catch {
+        /* missing base */
+      }
+    }
+    for (const d of dirs) {
+      const name = readPkgJson(d)?.name;
+      if (name) reg.set(name, d);
+    }
+  }
+  return reg;
+}
+
+/** Workspace packages the app at `appDir` depends on, transitively (name → dir). */
+function transitiveWorkspaceDeps(appDir: string, registry: Map<string, string>): Map<string, string> {
+  const out = new Map<string, string>();
+  const seen = new Set<string>();
+  const queue: string[] = [appDir];
+  while (queue.length) {
+    const dir = queue.shift()!;
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const pkg = readPkgJson(dir);
+    if (!pkg) continue;
+    const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}), ...(pkg.peerDependencies ?? {}) };
+    for (const name of Object.keys(deps)) {
+      const depDir = registry.get(name);
+      if (depDir && depDir !== appDir && !out.has(name)) {
+        out.set(name, depDir);
+        queue.push(depDir);
+      }
+    }
+  }
+  return out;
+}
+
+/** tsconfig-style `paths` + extra source files so an app's workspace deps resolve
+ *  WITHOUT node_modules (`@scope/common` → ../common/src), and their wrappers/components
+ *  are in the project file set (cross-package tracing). */
+function workspaceResolution(rootDir: string, baseUrl: string): { paths: ts.MapLike<string[]>; files: string[] } {
+  const wsRoot = findWorkspaceRoot(rootDir);
+  if (!wsRoot) return { paths: {}, files: [] };
+  const registry = workspacePackageRegistry(wsRoot);
+  if (!registry.size) return { paths: {}, files: [] };
+  const deps = transitiveWorkspaceDeps(rootDir, registry);
+  const paths: ts.MapLike<string[]> = {};
+  const files: string[] = [];
+  for (const [name, dir] of deps) {
+    const src = fs.existsSync(path.join(dir, 'src')) ? path.join(dir, 'src') : dir;
+    const rel = path.relative(baseUrl, src).split(path.sep).join('/') || '.';
+    paths[name] = [`${rel}/index`, rel];
+    paths[`${name}/*`] = [`${rel}/*`];
+    files.push(...collectSourceFiles(dir));
+  }
+  return { paths, files };
+}
+
 /** Best-effort: parse `resolve.alias` from a vite config into tsconfig-style paths. */
 function readViteAliases(rootDir: string): ts.MapLike<string[]> | undefined {
   const candidates = ['vite.config.ts', 'vite.config.js', 'vite.config.mjs'].map((f) => path.join(rootDir, f));
@@ -208,9 +345,18 @@ export interface BuildOptions {
 }
 
 export function buildProjectProgram(rootDir: string, opts: BuildOptions): ProjectProgram {
-  const fileNames = collectSourceFiles(rootDir);
   const tsconfig = readTsconfigOptions(rootDir);
   const viteAliases = readViteAliases(rootDir);
+  const baseUrl = tsconfig.baseUrl ?? rootDir;
+
+  // pnpm/turbo monorepo: pull in the app's workspace dependency packages so
+  // `@scope/common` imports resolve (no node_modules) and cross-package wrappers trace.
+  const ws = workspaceResolution(rootDir, baseUrl);
+  const fileNames = [...new Set([...collectSourceFiles(rootDir), ...ws.files])];
+
+  // explicit override wins, then the target's own tsconfig/vite aliases, then workspace paths.
+  const ownPaths = opts.aliasOverride ?? tsconfig.paths ?? viteAliases;
+  const mergedPaths = { ...ws.paths, ...(ownPaths ?? {}) };
 
   const options: ts.CompilerOptions = {
     target: ts.ScriptTarget.ES2021,
@@ -224,9 +370,8 @@ export function buildProjectProgram(rootDir: string, opts: BuildOptions): Projec
     skipDefaultLibCheck: true,
     allowNonTsExtensions: true,
     resolveJsonModule: true,
-    // honor target's aliases; explicit override wins, then tsconfig, then vite.
-    baseUrl: tsconfig.baseUrl ?? rootDir,
-    paths: opts.aliasOverride ?? tsconfig.paths ?? viteAliases,
+    baseUrl,
+    paths: Object.keys(mergedPaths).length ? mergedPaths : undefined,
   };
 
   const program = ts.createProgram(fileNames, options);

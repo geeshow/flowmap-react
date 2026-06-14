@@ -11,6 +11,10 @@
 import * as ts from 'typescript';
 import {
   CONTEXT_CREATE_FN,
+  JOTAI_ATOM_FNS,
+  JOTAI_MODULES,
+  RECOIL_ATOM_FNS,
+  RECOIL_MODULES,
   REDUX_ASYNC_THUNK_FN,
   REDUX_SLICE_FN,
   ZUSTAND_CREATE_FNS,
@@ -65,6 +69,10 @@ export function collectStores(sf: ts.SourceFile, ctx: AnalysisContext, acc: Stor
         handleThunk(decl, init, varName, ctx, acc, sf);
       } else if (ZUSTAND_CREATE_FNS.has(head.name) && isFrom(mod, 'zustand')) {
         handleZustand(decl, init, varName, ctx, acc, sf);
+      } else if (JOTAI_ATOM_FNS.has(head.name) && isFromAny(mod, JOTAI_MODULES)) {
+        handleAtomStore(decl, varName, ctx, acc, sf, 'jotai');
+      } else if (RECOIL_ATOM_FNS.has(head.name) && isFromAny(mod, RECOIL_MODULES)) {
+        handleAtomStore(decl, varName, ctx, acc, sf, 'recoil');
       } else if (head.name === CONTEXT_CREATE_FN && isFrom(mod, 'react')) {
         handleContext(decl, varName, ctx, acc, sf);
       }
@@ -167,10 +175,48 @@ function handleZustand(
     for (const p of stateObj.properties) {
       const k = propKeyName(p);
       if (!k) continue;
-      if (isFunctionProp(p)) actions.push(k);
+      if (!isFunctionProp(p)) continue;
+      actions.push(k);
+      // An action that makes HTTP calls (`fetchUser: async () => axios.get(...)`)
+      // becomes a walkable STORE-action node, so store → action → API edges form
+      // (mirrors the redux-thunk handling). Linked to the container by id prefix.
+      const fnNode = actionFnOf(p);
+      if (fnNode) {
+        const comp: IrComponent = {
+          id: `${storeId}#${k}`,
+          name: k,
+          kind: 'action',
+          exported: true,
+          isAsync: isAsyncNode(fnNode),
+          line: lineOf(sf, p),
+          jsxUsages: [],
+          calls: [],
+        };
+        acc.thunks.push({ comp, bodyOwner: fnNode, file: sf });
+      }
     }
   }
   pushStore(acc, ctx, sf, { storeId, name: varName, kind: 'zustand', actions, line: lineOf(sf, decl) });
+  const sym = ctx.symbolAt(decl.name);
+  if (sym) acc.bindings.bySymbol.set(sym, storeId);
+}
+
+/**
+ * Jotai `atom(...)` / Recoil `atom({...})` declarations become STORE nodes keyed
+ * by the variable symbol, so a component using `useAtom(x)` / `useRecoilState(x)`
+ * resolves to the same id. Both libraries use the `atom` factory; the import
+ * module disambiguates jotai from recoil.
+ */
+function handleAtomStore(
+  decl: ts.VariableDeclaration,
+  varName: string,
+  ctx: AnalysisContext,
+  acc: StoreAccumulator,
+  sf: ts.SourceFile,
+  kind: 'jotai' | 'recoil',
+): void {
+  const storeId = `store:${kind}:${varName}`;
+  pushStore(acc, ctx, sf, { storeId, name: varName, kind, actions: [], line: lineOf(sf, decl) });
   const sym = ctx.symbolAt(decl.name);
   if (sym) acc.bindings.bySymbol.set(sym, storeId);
 }
@@ -228,6 +274,10 @@ function isFrom(mod: string | null, expected: string): boolean {
   return mod === expected;
 }
 
+function isFromAny(mod: string | null, expected: Set<string>): boolean {
+  return mod != null && expected.has(mod);
+}
+
 function firstObjectArg(init: ts.Expression): ts.ObjectLiteralExpression | undefined {
   if (ts.isCallExpression(init)) {
     for (const a of init.arguments) if (ts.isObjectLiteralExpression(a)) return a;
@@ -283,6 +333,15 @@ function isFunctionProp(p: ts.ObjectLiteralElementLike): boolean {
     return ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer);
   }
   return false;
+}
+
+/** The function node backing a state action: a method, or an arrow/fn-expr property. */
+function actionFnOf(p: ts.ObjectLiteralElementLike): ts.Node | null {
+  if (ts.isMethodDeclaration(p)) return p;
+  if (ts.isPropertyAssignment(p) && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer))) {
+    return p.initializer;
+  }
+  return null;
 }
 
 function lineOf(sf: ts.SourceFile, node: ts.Node): number {

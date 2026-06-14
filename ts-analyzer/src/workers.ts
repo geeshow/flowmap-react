@@ -83,6 +83,7 @@ export interface WorkerArgs {
   entry: string; // script to run (process.argv[1])
   repoRoot: string;
   envFile?: string;
+  envProfile?: string;
   mode?: string;
 }
 
@@ -98,6 +99,7 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
     const tmp = tmpFor(root);
     const args = [a.entry, '__ir', '--root', root, '--repo', a.repoRoot, '--out', tmp];
     if (a.envFile) args.push('--env', a.envFile);
+    if (a.envProfile) args.push('--env-profile', a.envProfile);
     if (a.mode) args.push('--mode', a.mode);
     const env = { ...process.env, [RESPAWN_FLAG]: '1', NODE_OPTIONS: withHeap(plan.perWorkerMB) };
     process.stderr.write(`  → ${path.basename(root)}\n`);
@@ -131,6 +133,17 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
  * merged IR. The parent never holds a `ts.Program`, so its memory stays flat.
  */
 export async function runProjectWorkers(roots: string[], plan: WorkerPlan, a: WorkerArgs): Promise<IrFile[]> {
+  const batches = await runProjectWorkersByRoot(roots, plan, a);
+  const all: IrFile[] = [];
+  for (const b of batches) if (b) all.push(...b);
+  return all;
+}
+
+/**
+ * Like `runProjectWorkers`, but returns one `IrFile[]` (or null on failure) per
+ * root, in `roots` order — so callers can build a separate graph per service.
+ */
+export async function runProjectWorkersByRoot(roots: string[], plan: WorkerPlan, a: WorkerArgs): Promise<(IrFile[] | null)[]> {
   process.stderr.write(`analyze: ${roots.length} project roots, ${plan.workers} workers, ${plan.perWorkerMB}MB/worker\n`);
   const batches = await poolRun(roots, plan.workers, (r) => spawnOne(r, plan, a));
   // If EVERY root failed (non-zero exit, e.g. all out of memory), fail loudly
@@ -141,9 +154,7 @@ export async function runProjectWorkers(roots: string[], plan: WorkerPlan, a: Wo
         `raise the heap (FLOWMAP_MAX_OLD_SPACE) or reduce --workers`,
     );
   }
-  const all: IrFile[] = [];
-  for (const b of batches) if (b) all.push(...b);
-  return all;
+  return batches;
 }
 
 /** Run `task` over items with at most `limit` concurrent, preserving order. */

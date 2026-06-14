@@ -12,7 +12,17 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { REDUX_HOOKS, isComponentName, isHookName } from '../classify';
+import {
+  JOTAI_HOOKS,
+  RECOIL_HOOKS,
+  REDUX_HOOKS,
+  XSTATE_ACTOR_FNS,
+  XSTATE_HOOKS,
+  XSTATE_MODULES,
+  XSTATE_REACT_MODULES,
+  isComponentName,
+  isHookName,
+} from '../classify';
 import type {
   ComponentKind,
   IrCall,
@@ -29,7 +39,8 @@ import { ConstantEvaluator } from './constantEvaluator';
 import { AnalysisContext } from './context';
 import { EnvResolver } from './envResolver';
 import { buildProjectProgram, discoverProjects, isNextProject, provenance, repoRel } from './program';
-import { findNextRoutes, findReactRouterRoutes } from './routeResolver';
+import { NEXT_HANDLER_VERBS, findNextRoutes, findReactRouterRoutes, nextRouteHandlerPath, RouteDataFn } from './routeResolver';
+import { normalize } from '../norm';
 import { StoreAccumulator, collectStores, emptyAccumulator } from './storeResolver';
 
 interface CompMeta {
@@ -59,8 +70,11 @@ export class TsResolver implements Resolver {
     const pp = buildProjectProgram(projectRoot, { repoRoot });
     const ctx = new AnalysisContext(pp.checker, repoRoot, pp.program.getCompilerOptions(), pp.sourceFiles);
 
-    const env = new EnvResolver(opts.env);
-    env.loadDotenv(projectRoot);
+    // Env precedence (lowest→highest): .env-cmdrc profile → .env files → CLI --env.
+    const env = new EnvResolver();
+    env.loadEnvCmdrc(projectRoot, opts.envProfile, opts.mode ?? 'development', repoRoot);
+    env.loadDotenv(projectRoot, opts.mode ?? 'development');
+    for (const [k, v] of Object.entries(opts.env ?? {})) env.put(k, v);
     const constEval = new ConstantEvaluator(pp.checker, env);
     const api = new ApiCallResolver(pp.checker, constEval, repoRoot, pp.sourceFiles);
 
@@ -96,13 +110,108 @@ export class TsResolver implements Resolver {
       routesByFile.set(file, [...(routesByFile.get(file) ?? []), ...rs]);
     };
     const nextProject = isNextProject(projectRoot);
+    const dataFns: RouteDataFn[] = [];
     for (const sf of pp.sourceFiles) {
-      addRoutes(sf.fileName, findReactRouterRoutes(sf, ctx));
+      addRoutes(sf.fileName, findReactRouterRoutes(sf, ctx, dataFns));
       if (nextProject) addRoutes(sf.fileName, findNextRoutes(sf, ctx, projectRoot));
     }
 
+    // D2. react-router v6.4 data routers fetch in loader/action — attribute those
+    // HTTP calls to the screen component the route renders.
+    const compById = new Map(metas.map((m) => [m.comp.id, m]));
+    for (const { screenComponentId, fn } of dataFns) {
+      const screen = screenComponentId ? compById.get(screenComponentId) : undefined;
+      if (!screen) continue;
+      walker.walk({ comp: screen.comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
+    }
+
+    // D2b. Next.js server actions referenced via `<form action={fn}>` — walk the
+    //      action body attributed to the referencing component (it isn't "called").
+    const walkedActions = new Set<string>();
+    for (const { comp, fn } of walker.serverActionRefs) {
+      const key = `${comp.id}::${fn.getSourceFile().fileName}:${fn.pos}`;
+      if (walkedActions.has(key)) continue;
+      walkedActions.add(key);
+      walker.walk({ comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
+    }
+
+    // D2c. XState: a component using useMachine(orderMachine) inherits the machine's
+    //      actor (fromPromise/...) HTTP calls — walk those actor bodies into the component.
+    const machineActors = this.buildMachineActors(pp.sourceFiles, ctx);
+    const walkedMachines = new Set<string>();
+    for (const { comp, machineSym } of walker.machineRefs) {
+      for (const fn of machineActors.get(machineSym) ?? []) {
+        const key = `${comp.id}::${fn.getSourceFile().fileName}:${fn.pos}`;
+        if (walkedMachines.has(key)) continue;
+        walkedMachines.add(key);
+        walker.walk({ comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
+      }
+    }
+
+    // D3. Next.js route handlers (app/**/route.ts GET/POST..., pages/api default).
+    //     Retag them as provider endpoints whose id is the consumer's `ext:<M> <path>`
+    //     so the in-repo chain consumer → /api/foo → handler → upstream connects.
+    if (nextProject) this.tagRouteHandlers(metas, projectRoot);
+
     // assemble IrFile per source file
     return this.assembleFiles(pp.sourceFiles, repoRoot, metas, stores.stores, routesByFile, ctx);
+  }
+
+  /**
+   * Retag Next.js route-handler functions (already discovered as components because
+   * GET/POST are PascalCase) as provider endpoints. Their id becomes the consumer's
+   * `ext:<METHOD> <path>` so graphBuilder merges the two and the in-repo chain
+   * (consumer → /api/foo → handler → upstream) connects.
+   */
+  private tagRouteHandlers(metas: CompMeta[], projectRoot: string): void {
+    for (const m of metas) {
+      const c = m.comp;
+      if (c.kind !== 'component') continue;
+      const rel = path.relative(projectRoot, m.file.fileName).split(path.sep).join('/');
+      const epPath = nextRouteHandlerPath(rel);
+      if (epPath == null) continue;
+      let method: string | null;
+      if (NEXT_HANDLER_VERBS.has(c.name)) method = c.name; // App Router named verb export
+      else if (c.name === 'default') method = null; // pages/api catch-all handler
+      else continue;
+      const ep = normalize(epPath) || '/';
+      c.kind = 'route-handler';
+      c.providerEndpoint = ep;
+      c.providerMethod = method;
+      c.id = `ext:${method ?? 'ANY'} ${ep}`;
+    }
+  }
+
+  /**
+   * Map each `const m = createMachine({...})` (xstate) symbol to the actor functions
+   * inside its config — `fromPromise(fn)` / `fromCallback(fn)` etc. Their HTTP calls
+   * are attributed to any component that uses the machine via useMachine/useActor.
+   */
+  private buildMachineActors(sourceFiles: ts.SourceFile[], ctx: AnalysisContext): Map<ts.Symbol, ts.FunctionLikeDeclaration[]> {
+    const out = new Map<ts.Symbol, ts.FunctionLikeDeclaration[]>();
+    for (const sf of sourceFiles) {
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isVariableDeclaration(node) &&
+          ts.isIdentifier(node.name) &&
+          node.initializer &&
+          ts.isCallExpression(node.initializer) &&
+          ts.isIdentifier(node.initializer.expression) &&
+          node.initializer.expression.text === 'createMachine' &&
+          isFromModule(ctx.importModuleOf(node.initializer.expression), XSTATE_MODULES)
+        ) {
+          const sym = ctx.symbolAt(node.name);
+          if (sym) {
+            const fns: ts.FunctionLikeDeclaration[] = [];
+            collectActorFns(node.initializer, fns);
+            if (fns.length) out.set(sym, fns);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return out;
   }
 
   private assembleFiles(
@@ -166,13 +275,15 @@ export class TsResolver implements Resolver {
         if (meta) out.push(meta);
         continue;
       }
-      // const Foo = () => {} | function() {}
+      // const Foo = () => {} | function() {} | observer(() => {}) | memo(forwardRef(...))
       if (ts.isVariableStatement(stmt)) {
         for (const decl of stmt.declarationList.declarations) {
           if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
-          const init = decl.initializer;
-          if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) {
-            const meta = this.makeComp(decl.name.text, decl, init, sf, ctx, exported, isAsyncFn(init));
+          let fn: ts.ArrowFunction | ts.FunctionExpression | null = null;
+          if (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer)) fn = decl.initializer;
+          else if (ts.isCallExpression(decl.initializer)) fn = unwrapWrappedComponentFn(decl.initializer);
+          if (fn) {
+            const meta = this.makeComp(decl.name.text, decl, fn, sf, ctx, exported, isAsyncFn(fn));
             if (meta) out.push(meta);
           }
         }
@@ -216,6 +327,12 @@ export class TsResolver implements Resolver {
 
 /** Walks a single component/hook body collecting render usages and calls. */
 class BodyWalker {
+  /** `<form action={serverAction}>` references discovered during the walk; their
+   *  bodies are walked afterward, attributed to the referencing component. */
+  readonly serverActionRefs: { comp: IrComponent; fn: ts.FunctionLikeDeclaration }[] = [];
+  /** `useMachine(machine)` references — the machine's actor bodies are walked later. */
+  readonly machineRefs: { comp: IrComponent; machineSym: ts.Symbol }[] = [];
+
   constructor(
     private readonly ctx: AnalysisContext,
     private readonly api: ApiCallResolver,
@@ -237,22 +354,36 @@ class BodyWalker {
 
       // JSX render usage
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
-        const usage = this.jsxUsage(node, sf);
-        if (usage) m.comp.jsxUsages.push(usage);
+        const dyn = this.dynamicTagUsages(node, sf);
+        if (dyn.length) for (const u of dyn) m.comp.jsxUsages.push(u);
+        else {
+          const usage = this.jsxUsage(node, sf);
+          if (usage) m.comp.jsxUsages.push(usage);
+        }
+        this.collectServerActions(node, m.comp);
       }
 
       // calls
       if (ts.isCallExpression(node)) {
         const call = this.resolveCall(node, asyncDepth > 0, dispatchers, sf);
         if (call) m.comp.calls.push(call);
+        this.collectMachineRef(node, m.comp);
+      }
+
+      // realtime: new WebSocket(url) / new EventSource(url)
+      if (ts.isNewExpression(node)) {
+        const r = this.api.resolveNew(node);
+        if (r) m.comp.calls.push({ line: lineOf(sf, node), inAsyncCtx: asyncDepth > 0, resolution: r });
       }
 
       ts.forEachChild(node, visit);
       if (entered) asyncDepth--;
     };
-    // walk the body only (skip the signature)
+    // walk the body only (skip the signature). Visit the body ITSELF so a concise
+    // arrow body (`const useThing = (id) => useSWR(url)`) — where the body IS the
+    // call/JSX expression — isn't skipped.
     const body = bodyOf(m.bodyOwner);
-    if (body) ts.forEachChild(body, visit);
+    if (body) visit(body);
   }
 
   private jsxUsage(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, sf: ts.SourceFile): IrJsxUsage | null {
@@ -261,6 +392,147 @@ class BodyWalker {
     if (!isComponentName(simple)) return null; // native html element
     const resolved = this.ctx.resolveComponentRef(node.tagName as ts.Expression);
     return { tagName: tag, targetComponentId: resolved.id, lazy: resolved.lazy, line: lineOf(sf, node) };
+  }
+
+  /** `<form action={createPost}>` / `<button formAction={fn}>` where the referenced
+   *  function is a Next.js server action ('use server') → defer walking its body so
+   *  its HTTP calls are attributed to this component. */
+  private collectServerActions(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, comp: IrComponent): void {
+    for (const attr of node.attributes.properties) {
+      if (!ts.isJsxAttribute(attr)) continue;
+      const name = attr.name.getText(node.getSourceFile());
+      if (name !== 'action' && name !== 'formAction') continue;
+      if (!attr.initializer || !ts.isJsxExpression(attr.initializer) || !attr.initializer.expression) continue;
+      const ref = attr.initializer.expression;
+      if (!ts.isIdentifier(ref)) continue;
+      const fn = this.fnDeclOf(ref);
+      if (fn && isServerAction(fn)) this.serverActionRefs.push({ comp, fn });
+    }
+  }
+
+  /** `useMachine(orderMachine)` / `useActor(...)` (@xstate/react) — record the machine. */
+  private collectMachineRef(node: ts.CallExpression, comp: IrComponent): void {
+    if (!ts.isIdentifier(node.expression) || !XSTATE_HOOKS.has(node.expression.text)) return;
+    if (!isFromModule(this.ctx.importModuleOf(node.expression), XSTATE_REACT_MODULES)) return;
+    const arg = node.arguments[0];
+    if (arg && ts.isIdentifier(arg)) {
+      const machineSym = this.ctx.symbolAt(arg);
+      if (machineSym) this.machineRefs.push({ comp, machineSym });
+    }
+  }
+
+  private fnDeclOf(ref: ts.Identifier): ts.FunctionLikeDeclaration | null {
+    const sym = this.ctx.symbolAt(ref);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl) return null;
+    if (ts.isFunctionDeclaration(decl) && decl.body) return decl;
+    if (ts.isVariableDeclaration(decl) && decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
+      return decl.initializer;
+    }
+    return null;
+  }
+
+  /**
+   * Dynamic component render `arr.map((it) => <it.Comp/>)`: resolve the receiver
+   * `it` to a `.map` callback parameter, find the mapped array literal, and emit a
+   * render usage for each element's component-valued property. Covers the common
+   * data-driven widget-list pattern that a static `<Tag/>` walk misses.
+   */
+  private dynamicTagUsages(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, sf: ts.SourceFile): IrJsxUsage[] {
+    const tag = node.tagName;
+    // `<El/>` where `const El = cond ? A : B` (or `flag && A`) — emit an edge per branch.
+    if (ts.isIdentifier(tag)) {
+      if (!isComponentName(tag.text)) return [];
+      const sym = this.ctx.symbolAt(tag);
+      const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+      if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer) return [];
+      const init = decl.initializer;
+      if (!ts.isConditionalExpression(init) && !ts.isBinaryExpression(init)) return [];
+      const line = lineOf(sf, node);
+      const seen = new Set<string>();
+      const out: IrJsxUsage[] = [];
+      for (const branch of this.branchComponentExprs(init)) {
+        const r = this.ctx.resolveComponentRef(branch);
+        if (r.id && !seen.has(r.id)) {
+          seen.add(r.id);
+          out.push({ tagName: tag.text, targetComponentId: r.id, lazy: r.lazy, line });
+        }
+      }
+      return out;
+    }
+    if (!ts.isPropertyAccessExpression(tag) || !ts.isIdentifier(tag.expression)) return [];
+    if (!isComponentName(tag.name.text)) return []; // last segment must look like a component
+    const propName = tag.name.text;
+
+    const sym = this.ctx.symbolAt(tag.expression);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isParameter(decl)) return [];
+    const fn = decl.parent;
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return [];
+    const mapCall = fn.parent;
+    if (!ts.isCallExpression(mapCall) || !ts.isPropertyAccessExpression(mapCall.expression) || mapCall.expression.name.text !== 'map') {
+      return [];
+    }
+    const arr = this.resolveArrayLiteral(mapCall.expression.expression);
+    if (!arr) return [];
+
+    const line = lineOf(sf, node);
+    const seen = new Set<string>();
+    const out: IrJsxUsage[] = [];
+    for (const el of arr.elements) {
+      if (!ts.isObjectLiteralExpression(el)) continue;
+      for (const p of el.properties) {
+        let val: ts.Expression | undefined;
+        if (ts.isPropertyAssignment(p) && p.name.getText(sf) === propName) val = p.initializer;
+        else if (ts.isShorthandPropertyAssignment(p) && p.name.text === propName) val = p.name;
+        if (!val) continue;
+        const r = this.ctx.resolveComponentRef(val);
+        if (r.id && !seen.has(r.id)) {
+          seen.add(r.id);
+          out.push({ tagName: `${tag.expression.getText(sf)}.${propName}`, targetComponentId: r.id, lazy: r.lazy, line });
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Component identifier expressions inside a ternary/logical (`cond ? A : B`,
+   *  `flag && A`, `a ?? B`) — recursing into nested conditionals. */
+  private branchComponentExprs(expr: ts.Expression): ts.Expression[] {
+    const out: ts.Expression[] = [];
+    const collect = (e: ts.Expression) => {
+      if (ts.isParenthesizedExpression(e)) return collect(e.expression);
+      if (ts.isConditionalExpression(e)) {
+        collect(e.whenTrue);
+        collect(e.whenFalse);
+        return;
+      }
+      if (ts.isBinaryExpression(e)) {
+        const op = e.operatorToken.kind;
+        if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.QuestionQuestionToken || op === ts.SyntaxKind.BarBarToken) {
+          collect(e.left);
+          collect(e.right);
+          return;
+        }
+        return;
+      }
+      if (ts.isIdentifier(e) && isComponentName(e.text)) out.push(e);
+    };
+    collect(expr);
+    return out;
+  }
+
+  /** An array-literal expression directly, or via a variable that holds one. */
+  private resolveArrayLiteral(expr: ts.Expression): ts.ArrayLiteralExpression | null {
+    if (ts.isArrayLiteralExpression(expr)) return expr;
+    if (ts.isIdentifier(expr)) {
+      const sym = this.ctx.symbolAt(expr);
+      const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+      if (decl && ts.isVariableDeclaration(decl) && decl.initializer && ts.isArrayLiteralExpression(decl.initializer)) {
+        return decl.initializer;
+      }
+    }
+    return null;
   }
 
   private resolveCall(node: ts.CallExpression, inAsyncCtx: boolean, dispatchers: Set<ts.Symbol>, sf: ts.SourceFile): IrCall | null {
@@ -321,6 +593,16 @@ class BodyWalker {
         if (arg && ts.isIdentifier(arg)) {
           const csym = this.ctx.symbolAt(arg);
           const storeId = csym ? this.stores.bindings.bySymbol.get(csym) : undefined;
+          if (storeId) return { kind: 'storeRead', storeId, selector: null };
+        }
+        return null;
+      }
+      // jotai useAtom(x) / recoil useRecoilState(x) — the atom is the first arg.
+      if (JOTAI_HOOKS.has(callee.text) || RECOIL_HOOKS.has(callee.text)) {
+        const arg = node.arguments[0];
+        if (arg && ts.isIdentifier(arg)) {
+          const asym = this.ctx.symbolAt(arg);
+          const storeId = asym ? this.stores.bindings.bySymbol.get(asym) : undefined;
           if (storeId) return { kind: 'storeRead', storeId, selector: null };
         }
         return null;
@@ -409,13 +691,67 @@ function declNameNode(decl: ts.Node): ts.Node | null {
 }
 
 function bodyOf(owner: ts.Node): ts.Node | undefined {
-  if (ts.isFunctionDeclaration(owner) || ts.isFunctionExpression(owner) || ts.isArrowFunction(owner)) return owner.body;
+  if (
+    ts.isFunctionDeclaration(owner) ||
+    ts.isFunctionExpression(owner) ||
+    ts.isArrowFunction(owner) ||
+    ts.isMethodDeclaration(owner)
+  ) {
+    return owner.body;
+  }
   if (ts.isClassDeclaration(owner)) return owner;
   return undefined;
 }
 
 function isAsyncFn(node: ts.Node): boolean {
   return !!(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword));
+}
+
+function isFromModule(mod: string | null, set: Set<string>): boolean {
+  return mod != null && set.has(mod);
+}
+
+/** Collect XState actor functions (`fromPromise(fn)` / `fromCallback(fn)` …) inside
+ *  a createMachine config. */
+function collectActorFns(root: ts.Node, out: ts.FunctionLikeDeclaration[]): void {
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && XSTATE_ACTOR_FNS.has(node.expression.text)) {
+      const fn = node.arguments[0];
+      if (fn && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) out.push(fn);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(root);
+}
+
+/** Component-wrapping HOCs whose inline-function argument is still a component body
+ *  to walk: `const X = observer(() => {...})`, `memo(forwardRef((p, ref) => {...}))`. */
+const COMPONENT_WRAPPER_FNS = new Set(['observer', 'memo', 'forwardRef']);
+
+function unwrapWrappedComponentFn(call: ts.CallExpression): ts.ArrowFunction | ts.FunctionExpression | null {
+  const callee = call.expression;
+  const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
+  if (!name || !COMPONENT_WRAPPER_FNS.has(name)) return null;
+  for (const arg of call.arguments) {
+    if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) return arg;
+    if (ts.isCallExpression(arg)) {
+      const inner = unwrapWrappedComponentFn(arg);
+      if (inner) return inner;
+    }
+  }
+  return null;
+}
+
+/** A Next.js server action: a 'use server' directive at the top of the function body
+ *  or at the top of its source file. */
+function isServerAction(fn: ts.FunctionLikeDeclaration): boolean {
+  const useServer = (stmts: ts.NodeArray<ts.Statement> | undefined): boolean =>
+    !!stmts &&
+    stmts.some(
+      (s) => ts.isExpressionStatement(s) && ts.isStringLiteralLike(s.expression) && s.expression.text === 'use server',
+    );
+  if (fn.body && ts.isBlock(fn.body) && useServer(fn.body.statements)) return true;
+  return useServer(fn.getSourceFile().statements);
 }
 
 function hasExport(stmt: ts.Statement): boolean {

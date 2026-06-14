@@ -7,8 +7,8 @@
 
 import type { Confidence } from './model';
 
-export type ComponentKind = 'component' | 'hook' | 'function' | 'action';
-export type StoreKind = 'redux-slice' | 'zustand' | 'context' | 'vuex';
+export type ComponentKind = 'component' | 'hook' | 'function' | 'action' | 'route-handler';
+export type StoreKind = 'redux-slice' | 'zustand' | 'context' | 'vuex' | 'jotai' | 'recoil';
 export type RouteSource = 'react-router' | 'next-pages' | 'next-app' | 'nuxt-pages';
 
 /** A use of a child component in JSX (`<UserCard/>`). */
@@ -54,6 +54,9 @@ export interface IrComponent {
   line: number | null;
   jsxUsages: IrJsxUsage[]; // children rendered
   calls: IrCall[]; // resolved call sites
+  // For kind 'route-handler' (Next.js app/**/route.ts, pages/api): the served endpoint.
+  providerEndpoint?: string | null;
+  providerMethod?: string | null;
 }
 
 export interface IrRoute {
@@ -86,6 +89,7 @@ export interface ResolveOptions {
   repoRoot: string;
   projectFilter?: string | null;
   env?: Record<string, string>;
+  envProfile?: string | null; // env-cmd `.env-cmdrc` profile name (e.g. 'sandbox')
   mode?: string; // Vue/Nuxt config mode (development|production); ignored by React
 }
 

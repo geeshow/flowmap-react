@@ -18,11 +18,11 @@ import { CallGraph } from './model';
 import { checkGraph, formatHealth } from './doctor';
 import type { IrFile } from './ir';
 import { TsResolver } from './resolver/irBuilder';
-import { isReactProject, isVueProject } from './resolver/program';
+import { isReactProject, isVueProject, repoRel } from './resolver/program';
 import { discoverProjectRoots } from './resolver/projectScan';
 import { VueResolver } from './resolver/vue/vueIrBuilder';
 import { buildScreens } from './screens';
-import { ensureHeap, planWorkers, runProjectWorkers } from './workers';
+import { ensureHeap, planWorkers, runProjectWorkersByRoot } from './workers';
 
 interface Opts {
   flags: Record<string, string>;
@@ -61,7 +61,12 @@ function loadEnvFile(path?: string): Record<string, string> {
 
 /** Analyze ONE project root in-process (React and/or Vue) → IrFile[]. */
 function analyzeOneRoot(root: string, repoRoot: string, opts: Opts): IrFile[] {
-  const common = { repoRoot, projectFilter: null, env: loadEnvFile(opts.flags['--env']) };
+  const common = {
+    repoRoot,
+    projectFilter: null,
+    env: loadEnvFile(opts.flags['--env']),
+    envProfile: opts.flags['--env-profile'] || null,
+  };
   const files: IrFile[] = [];
   if (isReactProject(root)) files.push(...new TsResolver().analyzeRoot(root, repoRoot, common));
   if (isVueProject(root)) {
@@ -70,33 +75,66 @@ function analyzeOneRoot(root: string, repoRoot: string, opts: Opts): IrFile[] {
   return files;
 }
 
-async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: number; repo: string }> {
+/** A discovered project root analyzed as its own service: a self-contained graph. */
+interface ServiceResult {
+  name: string; // service id (repo-relative path, sanitized): "sample-shop-react", "packages-nextjs"
+  root: string; // repo-relative root dir
+  graph: CallGraph;
+  fileCount: number;
+}
+
+/** Service id from a root dir: repo-relative path with separators → "-" (collision-safe). */
+function serviceName(repoRoot: string, root: string): string {
+  const rel = path.relative(repoRoot, root).split(path.sep).join('/');
+  return (rel || path.basename(root)).replace(/\//g, '-');
+}
+
+/**
+ * Analyze the repo into BOTH a combined graph and one self-contained graph per
+ * project root (each root is treated as a distinct "service"). Per-root grouping
+ * is preserved (workers return per-root IR), so a monorepo app's cross-package
+ * deps land in that app's own service graph.
+ */
+async function analyzeRepoSplit(opts: Opts): Promise<{ combined: CallGraph; fileCount: number; repo: string; services: ServiceResult[] }> {
   const repo = opts.flags['--repo'] ?? '../.repo';
   const repoRoot = path.resolve(repo);
   const splitOff = '--no-split' in opts.flags;
   const w = parseInt(opts.flags['--workers'] ?? '', 10);
   const requestedWorkers = Number.isFinite(w) && w > 0 ? w : null; // ignore missing/NaN/<=0
 
-  // Single source of truth for the project set, so the graph is IDENTICAL whether
+  // Single source of truth for the project set, so output is IDENTICAL whether
   // we split into child processes or run in-process.
   const roots = discoverProjectRoots(repo, opts.flags['--project'] ?? null);
-  let files: IrFile[];
+  let perRoot: IrFile[][];
   if (!splitOff && roots.length > 1 && (requestedWorkers ?? 2) > 1) {
-    // Split into per-root child processes so each giant ts.Program's memory is
-    // freed when its worker exits; the parent only merges the lightweight IR.
+    // Per-root child processes so each giant ts.Program's memory is freed on exit.
     const plan = planWorkers(roots.length, requestedWorkers);
-    files = await runProjectWorkers(roots, plan, {
+    const batches = await runProjectWorkersByRoot(roots, plan, {
       entry: process.argv[1],
       repoRoot,
       envFile: opts.flags['--env'] || undefined,
+      envProfile: opts.flags['--env-profile'] || undefined,
       mode: opts.flags['--mode'] || undefined,
     });
+    perRoot = batches.map((b) => b ?? []);
   } else {
-    files = [];
-    for (const root of roots) files.push(...analyzeOneRoot(root, repoRoot, opts));
+    perRoot = roots.map((root) => analyzeOneRoot(root, repoRoot, opts));
   }
-  const graph = new GraphBuilder(files).build();
-  return { graph, fileCount: files.length, repo };
+
+  const services: ServiceResult[] = roots.map((root, i) => ({
+    name: serviceName(repoRoot, root),
+    root: repoRel(repoRoot, root),
+    graph: new GraphBuilder(perRoot[i]).build(),
+    fileCount: perRoot[i].length,
+  }));
+  const allFiles = perRoot.flat();
+  const combined = new GraphBuilder(allFiles).build();
+  return { combined, fileCount: allFiles.length, repo, services };
+}
+
+async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: number; repo: string }> {
+  const { combined, fileCount, repo } = await analyzeRepoSplit(opts);
+  return { graph: combined, fileCount, repo };
 }
 
 /** Hidden worker entrypoint: analyze ONE project root and write IrFile[] JSON. */
@@ -145,16 +183,36 @@ function refreshManifest(out: string | undefined): void {
 }
 
 async function cmdAnalyze(opts: Opts): Promise<void> {
-  const { graph, fileCount, repo } = await analyzeRepo(opts);
-  dump(graph, opts.flags['--out'], {
+  const { combined, fileCount, repo, services } = await analyzeRepoSplit(opts);
+  const out = opts.flags['--out'];
+  dump(combined, out, {
     command: 'analyze',
     repo,
     project: opts.flags['--project'] ?? null,
     files: fileCount,
-    nodes: graph.nodes.length,
-    edges: graph.edges.length,
+    nodes: combined.nodes.length,
+    edges: combined.edges.length,
+    services: services.map((s) => s.name),
   });
-  refreshManifest(opts.flags['--out']);
+  // Each project root → its own `<service>.json` (a distinct service), so the
+  // _manifest.json catalogues them individually. Combined graph stays as `--out`.
+  if (out && services.length > 1) {
+    const dir = path.dirname(out) || '.';
+    const combinedBase = path.basename(out, '.json');
+    for (const s of services) {
+      if (s.name === combinedBase) continue; // never clobber the combined graph
+      dump(s.graph, path.join(dir, `${s.name}.json`), {
+        command: 'analyze',
+        repo,
+        project: s.name,
+        root: s.root,
+        files: s.fileCount,
+        nodes: s.graph.nodes.length,
+        edges: s.graph.edges.length,
+      });
+    }
+  }
+  refreshManifest(out);
 }
 
 function cmdJoin(opts: Opts): void {
@@ -246,6 +304,7 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   const backend = pick('--backend', 'BACKEND');
   const mode = pick('--mode', 'MODE');
   const envFile = pick('--env', 'ENV');
+  const envProfile = pick('--env-profile', 'ENV_PROFILE');
   const workers = pick('--workers', 'WORKERS');
   const noSplit = '--no-split' in opts.flags || /^(1|true|yes)$/i.test(cfg.NO_SPLIT ?? '');
   const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
@@ -262,6 +321,7 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   if (project) common['--project'] = project;
   if (mode) common['--mode'] = mode;
   if (envFile) common['--env'] = envFile;
+  if (envProfile) common['--env-profile'] = envProfile;
   if (workers) common['--workers'] = workers;
   if (noSplit) common['--no-split'] = '';
 
@@ -371,7 +431,7 @@ function usage(): void {
     [
       'flowmap-react (TypeScript Compiler API)',
       '  pipeline [--config flowmap.config]   # refresh repo → analyze → screens → join, options from config',
-      '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--mode development|production]',
+      '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--env-profile name] [--mode development|production]',
       '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
       '  join    --graph front.json --backend backend.json [--out join.json]',
       '  search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]',

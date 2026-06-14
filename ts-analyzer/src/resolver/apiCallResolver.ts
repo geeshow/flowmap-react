@@ -13,7 +13,22 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, isComponentName, isHookName } from '../classify';
+import {
+  APOLLO_HOOKS,
+  APOLLO_MODULES,
+  AXIOS_MODULES,
+  AXIOS_REQUEST_METHODS,
+  AXIOS_VERB_METHODS,
+  GRAPHQL_REQUEST_MODULES,
+  HTTP_CLIENT_MODULES,
+  REALTIME_CLIENT_MODULES,
+  SWR_MUTATION_MODULES,
+  SWR_QUERY_MODULES,
+  URQL_HOOKS,
+  URQL_MODULES,
+  isComponentName,
+  isHookName,
+} from '../classify';
 import type { ApiResolution } from '../ir';
 import type { Confidence } from '../model';
 import { normalize } from '../norm';
@@ -40,6 +55,13 @@ export interface RawHttp {
 export class ApiCallResolver {
   private readonly instanceCache = new Map<ts.Symbol, InstanceInfo | null>();
   private readonly projectFiles: Set<string>;
+  /** RTK Query generated-hook name → resolved endpoint (built once from createApi). */
+  private readonly rtkHooks: Map<string, ApiResolution>;
+  private readonly sourceFiles: ts.SourceFile[];
+  /** callee symbol → its call sites across the project (lazily built). */
+  private callSiteIndex: Map<ts.Symbol, ts.CallExpression[]> | null = null;
+  /** Project-wide GraphQL endpoint bases: the uri/url on the (singleton) client. */
+  private readonly graphqlBases: { apollo: EvalString | null; urql: EvalString | null };
 
   constructor(
     private readonly checker: ts.TypeChecker,
@@ -48,13 +70,45 @@ export class ApiCallResolver {
     sourceFiles: ts.SourceFile[],
   ) {
     this.projectFiles = new Set(sourceFiles.map((sf) => path.resolve(sf.fileName)));
+    this.sourceFiles = sourceFiles;
+    this.rtkHooks = this.buildRtkRegistry(sourceFiles);
+    this.graphqlBases = this.buildGraphqlBases(sourceFiles);
   }
 
   /** Resolve a call to an ApiResolution, or null if it is not an HTTP call. */
   resolve(call: ts.CallExpression): ApiResolution | null {
+    // RTK Query generated hook: useGetWidgetQuery() → its endpoint.
+    if (this.rtkHooks.size && ts.isIdentifier(call.expression)) {
+      const hit = this.rtkHooks.get(call.expression.text);
+      if (hit) return hit;
+    }
     const raw = this.classifyHttpCall(call);
-    if (raw) return this.buildFromRaw(raw, call, []);
+    if (raw) {
+      // A url that is an unbound parameter of the ENCLOSING function (a custom data
+      // hook like `useApi(url) → useQuery(() => axios.get(url))`) can't resolve from
+      // the definition alone. Bind it from the hook's call sites when they agree.
+      const bound = this.bindUrlFromCallSites(raw.urlExpr);
+      if (bound) return this.buildFromRaw({ ...raw, urlExpr: bound }, call, []);
+      return this.buildFromRaw(raw, call, []);
+    }
     return this.traceWrapper(call, new Set());
+  }
+
+  /** `new WebSocket(url)` / `new EventSource(url)` — realtime external endpoints
+   *  (browser globals, detected by constructor name). */
+  resolveNew(node: ts.NewExpression): ApiResolution | null {
+    if (!ts.isIdentifier(node.expression)) return null;
+    const name = node.expression.text;
+    if (name !== 'WebSocket' && name !== 'EventSource') return null;
+    const raw: RawHttp = {
+      method: name === 'EventSource' ? 'GET' : null, // SSE is an HTTP GET; ws has no verb
+      verbConfident: name === 'EventSource',
+      urlExpr: node.arguments?.[0],
+      service: name === 'EventSource' ? 'sse' : 'websocket',
+      instanceBaseUrl: null,
+      clientPackage: null,
+    };
+    return this.buildFromRaw(raw, node as unknown as ts.CallExpression, []);
   }
 
   // ---- direct client classification ----
@@ -62,14 +116,18 @@ export class ApiCallResolver {
   protected classifyHttpCall(call: ts.CallExpression): RawHttp | null {
     const callee = call.expression;
 
-    // fetch(url, opts)
+    // fetch(url, opts) — also fetch(new Request(url, { method }))
     if (ts.isIdentifier(callee) && callee.text === 'fetch' && this.isGlobalFetch(callee)) {
-      const opts = call.arguments[1];
-      const m = this.methodFromConfig(opts);
+      let urlExpr = call.arguments[0];
+      let m = this.methodFromConfig(call.arguments[1]);
+      if (urlExpr && ts.isNewExpression(urlExpr) && ts.isIdentifier(urlExpr.expression) && urlExpr.expression.text === 'Request') {
+        if (m == null) m = this.methodFromConfig(urlExpr.arguments?.[1]); // verb lives inside the Request init
+        if (urlExpr.arguments?.[0]) urlExpr = urlExpr.arguments[0];
+      }
       return {
         method: m ?? 'GET',
         verbConfident: m != null,
-        urlExpr: call.arguments[0],
+        urlExpr,
         service: 'fetch',
         instanceBaseUrl: null,
         clientPackage: null,
@@ -81,10 +139,81 @@ export class ApiCallResolver {
       return this.configForm(call, { name: 'axios', baseUrl: null, clientPackage: null });
     }
 
+    // ky(url, {method}) / got(url, {method}) — callable HTTP clients
+    if (ts.isIdentifier(callee)) {
+      const client = this.httpClientName(callee);
+      if (client) {
+        const m = this.methodFromConfig(call.arguments[1]);
+        return { method: m ?? 'GET', verbConfident: m != null, urlExpr: call.arguments[0], service: client, instanceBaseUrl: null, clientPackage: null };
+      }
+    }
+
+    // useSWR(key, fetcher) — the key is the request URL (GET). Default-imported,
+    // so detect by module ('swr' / 'swr/immutable' / 'swr/infinite'), not name.
+    if (ts.isIdentifier(callee)) {
+      const mod = this.importModuleOf(this.checker.getSymbolAtLocation(callee));
+      if (mod && SWR_QUERY_MODULES.has(mod)) {
+        return {
+          method: 'GET',
+          verbConfident: true,
+          urlExpr: this.swrKeyExpr(call.arguments[0]),
+          service: 'swr',
+          instanceBaseUrl: null,
+          clientPackage: null,
+        };
+      }
+      // useSWRMutation(key, fetcher) — key is the URL, a write. The verb defaults to
+      // POST (SWR mutations are writes) unless the fetcher's inner call says otherwise.
+      if (mod && SWR_MUTATION_MODULES.has(mod)) {
+        const fetcherVerb = this.fetcherVerb(call.arguments[1]);
+        return {
+          method: fetcherVerb ?? 'POST',
+          verbConfident: fetcherVerb != null,
+          urlExpr: this.swrKeyExpr(call.arguments[0]),
+          service: 'swr-mutation',
+          instanceBaseUrl: null,
+          clientPackage: null,
+        };
+      }
+      // graphql-request: request(url, query) — a POST to the GraphQL endpoint.
+      if (callee.text === 'request' && mod && GRAPHQL_REQUEST_MODULES.has(mod)) {
+        return { method: 'POST', verbConfident: true, urlExpr: call.arguments[0], service: 'graphql-request', instanceBaseUrl: null, clientPackage: null };
+      }
+      // Apollo / urql hooks — the GraphQL endpoint lives on the project-singleton client
+      // (`new ApolloClient({uri})` / `createClient({url})`), not at the call site.
+      if (mod && APOLLO_MODULES.has(mod) && APOLLO_HOOKS.has(callee.text) && this.graphqlBases.apollo) {
+        return this.graphqlBaseRaw(this.graphqlBases.apollo, 'apollo');
+      }
+      if (mod && URQL_MODULES.has(mod) && URQL_HOOKS.has(callee.text) && this.graphqlBases.urql) {
+        return this.graphqlBaseRaw(this.graphqlBases.urql, 'urql');
+      }
+      // socket.io-client: io(url) / connect(url) — a realtime (ws) external endpoint.
+      if ((callee.text === 'io' || callee.text === 'connect') && mod && REALTIME_CLIENT_MODULES.has(mod)) {
+        return { method: null, verbConfident: false, urlExpr: call.arguments[0], service: 'socket.io', instanceBaseUrl: null, clientPackage: mod };
+      }
+    }
+
     // recv.method(...)
     if (ts.isPropertyAccessExpression(callee)) {
       const method = callee.name.text;
       const recv = callee.expression;
+      // graphql-request: const c = new GraphQLClient(url); c.request(query) — POST to the endpoint.
+      if (method === 'request') {
+        const gqlBase = this.graphqlClientBaseUrl(recv);
+        if (gqlBase) {
+          return { method: 'POST', verbConfident: true, urlExpr: undefined, service: 'graphql-request', instanceBaseUrl: gqlBase, clientPackage: null };
+        }
+      }
+      // Apollo imperative: const c = new ApolloClient({uri}); c.query/.mutate/.subscribe(...) — POST.
+      if (method === 'query' || method === 'mutate' || method === 'subscribe') {
+        const apolloBase = this.apolloClientBaseUrl(recv);
+        if (apolloBase) return { method: 'POST', verbConfident: true, urlExpr: undefined, service: 'apollo', instanceBaseUrl: apolloBase, clientPackage: null };
+      }
+      // ky/got/superagent: client.get/post(url) (verb chains like .send() wrap this inner call)
+      const client = this.httpClientName(recv);
+      if (client && AXIOS_VERB_METHODS.has(method)) {
+        return { method: method.toUpperCase(), verbConfident: true, urlExpr: call.arguments[0], service: client, instanceBaseUrl: null, clientPackage: null };
+      }
       const recvIsAxios = this.isAxiosImport(recv);
       const inst = recvIsAxios ? { name: 'axios', baseUrl: null, clientPackage: null } : this.axiosInstanceInfo(recv);
       if (!inst) return null;
@@ -105,6 +234,26 @@ export class ApiCallResolver {
       return null;
     }
 
+    // axios[method](url) / instance[method](url) — dynamic verb. The verb is computed,
+    // so resolve it if it's a constant; otherwise emit the endpoint with an unknown verb.
+    if (ts.isElementAccessExpression(callee)) {
+      const recv = callee.expression;
+      const recvIsAxios = this.isAxiosImport(recv);
+      const inst = recvIsAxios ? { name: 'axios', baseUrl: null, clientPackage: null } : this.axiosInstanceInfo(recv);
+      if (inst && callee.argumentExpression) {
+        const mv = this.constEval.evalString(callee.argumentExpression);
+        const verb = mv.value && AXIOS_VERB_METHODS.has(mv.value.toLowerCase()) ? mv.value.toUpperCase() : null;
+        return {
+          method: verb,
+          verbConfident: verb != null,
+          urlExpr: call.arguments[0],
+          service: inst.name ?? 'axios',
+          instanceBaseUrl: inst.baseUrl,
+          clientPackage: inst.clientPackage,
+        };
+      }
+    }
+
     // instance(config) — callable axios instance
     if (ts.isIdentifier(callee)) {
       const inst = this.axiosInstanceInfo(callee);
@@ -112,6 +261,88 @@ export class ApiCallResolver {
     }
 
     return null;
+  }
+
+  /** Verb of an SWR-mutation fetcher: the method of the first HTTP call in its body. */
+  private fetcherVerb(fetcher: ts.Expression | undefined): string | null {
+    if (!fetcher) return null;
+    let body: ts.Node | undefined;
+    if (ts.isArrowFunction(fetcher) || ts.isFunctionExpression(fetcher)) body = fetcher.body;
+    else {
+      const decl = this.functionDeclOf(fetcher); // named fetcher (createUser)
+      body = decl?.body;
+    }
+    if (!body) return null;
+    const inner = this.findInnerHttpCall(body);
+    return inner && inner.raw.verbConfident ? inner.raw.method : null;
+  }
+
+  /** A GraphQL hook (apollo/urql) call → POST to the project client's endpoint. */
+  private graphqlBaseRaw(base: EvalString, service: string): RawHttp {
+    return { method: 'POST', verbConfident: true, urlExpr: undefined, service, instanceBaseUrl: base, clientPackage: null };
+  }
+
+  /** Scan the project once for the GraphQL endpoint base: `new ApolloClient({uri})` /
+   *  `new HttpLink({uri})` / `createHttpLink({uri})` (apollo) and `createClient({url})` (urql). */
+  private buildGraphqlBases(sourceFiles: ts.SourceFile[]): { apollo: EvalString | null; urql: EvalString | null } {
+    let apollo: EvalString | null = null;
+    let urql: EvalString | null = null;
+    const uriOf = (argsHost: ts.NewExpression | ts.CallExpression, key: string): EvalString | null => {
+      const arg = argsHost.arguments?.[0];
+      if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
+      const e = this.propExpr(arg, key);
+      return e ? this.constEval.evalString(e) : null;
+    };
+    for (const sf of sourceFiles) {
+      const visit = (node: ts.Node) => {
+        if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)) {
+          const name = node.expression.text;
+          const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node.expression));
+          if (!apollo && (name === 'ApolloClient' || name === 'HttpLink') && mod && APOLLO_MODULES.has(mod)) {
+            apollo = uriOf(node, 'uri') ?? apollo;
+          }
+        }
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+          const name = node.expression.text;
+          const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node.expression));
+          if (!apollo && name === 'createHttpLink' && mod && APOLLO_MODULES.has(mod)) apollo = uriOf(node, 'uri') ?? apollo;
+          if (!urql && name === 'createClient' && mod && URQL_MODULES.has(mod)) urql = uriOf(node, 'url') ?? urql;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return { apollo, urql };
+  }
+
+  /** baseUrl of `const c = new ApolloClient({ uri })` (@apollo/client), or null. */
+  private apolloClientBaseUrl(node: ts.Expression): EvalString | null {
+    if (!ts.isIdentifier(node)) return null;
+    const sym = this.checker.getSymbolAtLocation(node);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer || !ts.isNewExpression(decl.initializer)) return null;
+    const ne = decl.initializer;
+    if (!ts.isIdentifier(ne.expression) || ne.expression.text !== 'ApolloClient') return null;
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(ne.expression));
+    if (!mod || !APOLLO_MODULES.has(mod)) return null;
+    const arg = ne.arguments?.[0];
+    if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
+    const uri = this.propExpr(arg, 'uri');
+    return uri ? this.constEval.evalString(uri) : null;
+  }
+
+  /** baseUrl of `const c = new GraphQLClient(url)` (graphql-request), or null. */
+  private graphqlClientBaseUrl(node: ts.Expression): EvalString | null {
+    if (!ts.isIdentifier(node)) return null;
+    const sym = this.checker.getSymbolAtLocation(node);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer || !ts.isNewExpression(decl.initializer)) return null;
+    const ne = decl.initializer;
+    if (!ts.isIdentifier(ne.expression) || ne.expression.text !== 'GraphQLClient') return null;
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(ne.expression));
+    if (!mod || !GRAPHQL_REQUEST_MODULES.has(mod)) return null;
+    const urlArg = ne.arguments?.[0];
+    return urlArg ? this.constEval.evalString(urlArg) : null;
   }
 
   /** axios({ method, url }) / instance.request({ method, url }) form. */
@@ -133,6 +364,21 @@ export class ApiCallResolver {
       instanceBaseUrl: inst.baseUrl,
       clientPackage: inst.clientPackage,
     };
+  }
+
+  /** SWR key → URL expression: a string/template directly, an array's first
+   *  element (`[url, params]`), or a key thunk's body (`() => url`). */
+  private swrKeyExpr(key: ts.Expression | undefined): ts.Expression | undefined {
+    if (!key) return undefined;
+    if (ts.isArrayLiteralExpression(key)) return key.elements[0];
+    if ((ts.isArrowFunction(key) || ts.isFunctionExpression(key)) && key.body) {
+      if (ts.isBlock(key.body)) {
+        for (const st of key.body.statements) if (ts.isReturnStatement(st) && st.expression) return st.expression;
+        return undefined;
+      }
+      return key.body;
+    }
+    return key;
   }
 
   private methodFromConfig(cfg: ts.Expression | undefined): string | null {
@@ -226,7 +472,9 @@ export class ApiCallResolver {
       }
       ts.forEachChild(node, visit);
     };
-    ts.forEachChild(body, visit);
+    // Visit `body` ITSELF — a concise arrow body (`(id) => client.get(url)`) IS
+    // the call expression, so visiting only its children would miss it.
+    visit(body);
     return found;
   }
 
@@ -266,6 +514,81 @@ export class ApiCallResolver {
     return null;
   }
 
+  /**
+   * When `urlExpr` is a bare parameter of its enclosing function, infer the URL from
+   * that function's call sites: if every call passes the same resolved literal at the
+   * param position, bind it. Returns null when the param has zero or conflicting args.
+   */
+  private bindUrlFromCallSites(urlExpr: ts.Expression | undefined): ts.Expression | null {
+    if (!urlExpr || !ts.isIdentifier(urlExpr)) return null;
+    const sym = this.checker.getSymbolAtLocation(urlExpr);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isParameter(decl)) return null;
+    const fn = decl.parent;
+    if (!this.isFunctionLike(fn)) return null;
+    const pIdx = fn.parameters.indexOf(decl);
+    if (pIdx < 0) return null;
+    const fnSym = this.declaredFnSymbol(fn);
+    if (!fnSym) return null;
+
+    const distinct = new Map<string, ts.Expression>();
+    for (const site of this.callSitesOf(fnSym)) {
+      const arg = site.arguments[pIdx];
+      if (!arg) continue;
+      const ev = this.constEval.evalString(arg);
+      if (ev.value != null && !ev.hasPlaceholder) distinct.set(ev.value, arg);
+    }
+    return distinct.size === 1 ? [...distinct.values()][0] : null;
+  }
+
+  private isFunctionLike(node: ts.Node): node is ts.FunctionLikeDeclaration {
+    return (
+      ts.isFunctionDeclaration(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isMethodDeclaration(node)
+    );
+  }
+
+  /** The symbol naming a function declaration / `const f = () => …`, for call-site lookup. */
+  private declaredFnSymbol(fn: ts.FunctionLikeDeclaration): ts.Symbol | undefined {
+    if ((ts.isFunctionDeclaration(fn) || ts.isMethodDeclaration(fn)) && fn.name) return this.checker.getSymbolAtLocation(fn.name);
+    if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && ts.isVariableDeclaration(fn.parent) && ts.isIdentifier(fn.parent.name)) {
+      return this.checker.getSymbolAtLocation(fn.parent.name);
+    }
+    return undefined;
+  }
+
+  /** Call sites of a function symbol across the project (index built once). */
+  private callSitesOf(fnSym: ts.Symbol): ts.CallExpression[] {
+    if (!this.callSiteIndex) {
+      this.callSiteIndex = new Map();
+      for (const sf of this.sourceFiles) {
+        const visit = (node: ts.Node) => {
+          if (ts.isCallExpression(node) && (ts.isIdentifier(node.expression) || ts.isPropertyAccessExpression(node.expression))) {
+            const target = ts.isIdentifier(node.expression) ? node.expression : node.expression.name;
+            let s = this.checker.getSymbolAtLocation(target);
+            if (s && s.flags & ts.SymbolFlags.Alias) {
+              try {
+                s = this.checker.getAliasedSymbol(s);
+              } catch {
+                /* not an alias */
+              }
+            }
+            if (s) {
+              const arr = this.callSiteIndex!.get(s);
+              if (arr) arr.push(node);
+              else this.callSiteIndex!.set(s, [node]);
+            }
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(sf);
+      }
+    }
+    return this.callSiteIndex.get(fnSym) ?? [];
+  }
+
   /** A destructured-param binding (`fn({ url })` / `fn({ url: u })`) → caller's object property. */
   private bindFromDestructured(
     be: ts.BindingElement,
@@ -299,7 +622,9 @@ export class ApiCallResolver {
       }
       ts.forEachChild(node, visit);
     };
-    ts.forEachChild(body, visit);
+    // Visit `body` ITSELF — a concise arrow body (`(id) => client.get(url)`) IS
+    // the call expression, so visiting only its children would miss it.
+    visit(body);
     return found;
   }
 
@@ -366,6 +691,112 @@ export class ApiCallResolver {
     return { value, hasPlaceholder: base.hasPlaceholder || p.includes('${') };
   }
 
+  // ---- RTK Query (createApi) ----
+
+  /** Scan every source file for `createApi({...})` and map each endpoint's
+   *  generated hook name (useXQuery / useLazyXQuery / useXMutation) to its
+   *  resolved endpoint, so a component calling that hook resolves to the API. */
+  private buildRtkRegistry(sourceFiles: ts.SourceFile[]): Map<string, ApiResolution> {
+    const out = new Map<string, ApiResolution>();
+    for (const sf of sourceFiles) {
+      const visit = (node: ts.Node) => {
+        if (ts.isCallExpression(node)) {
+          const c = node.expression;
+          // createApi({...}) (with the RTK import) or <api>.injectEndpoints/enhanceEndpoints({...})
+          const isCreate = ts.isIdentifier(c) && c.text === 'createApi' && this.isReduxToolkitImport(c);
+          const isInject = ts.isPropertyAccessExpression(c) && (c.name.text === 'injectEndpoints' || c.name.text === 'enhanceEndpoints');
+          if (isCreate || isInject) this.parseCreateApi(node, out);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return out;
+  }
+
+  private parseCreateApi(call: ts.CallExpression, out: Map<string, ApiResolution>): void {
+    const cfg = call.arguments[0];
+    if (!cfg || !ts.isObjectLiteralExpression(cfg)) return;
+
+    // baseUrl from `baseQuery: fetchBaseQuery({ baseUrl })`
+    let baseUrl: EvalString | null = null;
+    const bq = this.propExpr(cfg, 'baseQuery');
+    if (bq && ts.isCallExpression(bq) && bq.arguments[0] && ts.isObjectLiteralExpression(bq.arguments[0])) {
+      const bu = this.propExpr(bq.arguments[0], 'baseUrl');
+      if (bu) baseUrl = this.constEval.evalString(bu);
+    }
+
+    // endpoints: (builder) => ({ name: builder.query/mutation({ query }) })
+    const epFn = this.propExpr(cfg, 'endpoints');
+    const epObj = epFn && this.fnReturnExpr(epFn);
+    if (!epObj || !ts.isObjectLiteralExpression(epObj)) return;
+
+    for (const p of epObj.properties) {
+      if (!ts.isPropertyAssignment(p)) continue;
+      const name = this.propName(p.name);
+      if (!name || !ts.isCallExpression(p.initializer)) continue;
+      const callee = p.initializer.expression;
+      if (!ts.isPropertyAccessExpression(callee)) continue;
+      const kind = callee.name.text; // query | mutation | infiniteQuery
+      if (kind !== 'query' && kind !== 'mutation' && kind !== 'infiniteQuery') continue;
+      const epCfg = p.initializer.arguments[0];
+      if (!epCfg || !ts.isObjectLiteralExpression(epCfg)) continue;
+      const queryFn = this.propExpr(epCfg, 'query');
+      if (!queryFn) continue; // custom queryFn (no static url) — skip
+      const ret = this.fnReturnExpr(queryFn);
+      if (!ret) continue;
+
+      let urlExpr: ts.Expression | undefined = ret;
+      // .query is a GET (definite); .mutation defaults to POST (an assumption
+      // unless the config states the method explicitly).
+      let method = kind === 'mutation' ? 'POST' : 'GET';
+      let verbConfident = kind !== 'mutation';
+      if (ts.isObjectLiteralExpression(ret)) {
+        // query: (a) => ({ url, method, body })
+        urlExpr = this.propExpr(ret, 'url');
+        const m = this.methodFromConfig(ret);
+        if (m) { method = m; verbConfident = true; }
+      }
+      const raw: RawHttp = {
+        method,
+        verbConfident,
+        urlExpr,
+        service: 'rtk-query',
+        instanceBaseUrl: baseUrl,
+        clientPackage: null,
+      };
+      const resolution = this.buildFromRaw(raw, call, ['createApi', name]);
+      const Pascal = name.charAt(0).toUpperCase() + name.slice(1);
+      if (kind === 'mutation') {
+        out.set(`use${Pascal}Mutation`, resolution);
+      } else {
+        out.set(`use${Pascal}Query`, resolution);
+        out.set(`useLazy${Pascal}Query`, resolution);
+      }
+    }
+  }
+
+  /** The expression a function returns: a concise arrow body, or the first
+   *  `return` in a block. Unwraps a parenthesized object literal. */
+  private fnReturnExpr(fn: ts.Expression): ts.Expression | undefined {
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return undefined;
+    let body: ts.Expression | undefined;
+    if (ts.isBlock(fn.body)) {
+      for (const st of fn.body.statements) {
+        if (ts.isReturnStatement(st) && st.expression) { body = st.expression; break; }
+      }
+    } else {
+      body = fn.body; // concise body expression
+    }
+    while (body && ts.isParenthesizedExpression(body)) body = body.expression;
+    return body;
+  }
+
+  private isReduxToolkitImport(node: ts.Identifier): boolean {
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node));
+    return mod != null && mod.startsWith('@reduxjs/toolkit');
+  }
+
   // ---- symbol helpers ----
 
   private isGlobalFetch(node: ts.Identifier): boolean {
@@ -379,7 +810,34 @@ export class ApiCallResolver {
     if (!ts.isIdentifier(node)) return false;
     const sym = this.checker.getSymbolAtLocation(node);
     const mod = this.importModuleOf(sym);
-    return mod != null && AXIOS_MODULES.has(mod);
+    if (mod != null && AXIOS_MODULES.has(mod)) return true;
+    // dynamic: const axios = (await import('axios')).default
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (decl && ts.isVariableDeclaration(decl) && decl.initializer) return this.isDynamicAxiosExpr(decl.initializer);
+    return false;
+  }
+
+  /** `(await import('axios')).default` / `await import('axios')` → an axios binding. */
+  private isDynamicAxiosExpr(e: ts.Expression): boolean {
+    let expr = e;
+    if (ts.isPropertyAccessExpression(expr) && expr.name.text === 'default') expr = expr.expression;
+    while (ts.isParenthesizedExpression(expr) || ts.isAwaitExpression(expr)) {
+      expr = ts.isParenthesizedExpression(expr) ? expr.expression : expr.expression;
+    }
+    return (
+      ts.isCallExpression(expr) &&
+      expr.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      !!expr.arguments[0] &&
+      ts.isStringLiteralLike(expr.arguments[0]) &&
+      AXIOS_MODULES.has(expr.arguments[0].text)
+    );
+  }
+
+  /** If `node` is a default import of ky/got/superagent, its module name; else null. */
+  private httpClientName(node: ts.Expression): string | null {
+    if (!ts.isIdentifier(node)) return null;
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node));
+    return mod != null && HTTP_CLIENT_MODULES.has(mod) ? mod : null;
   }
 
   private importModuleOf(sym: ts.Symbol | undefined): string | null {
@@ -395,7 +853,8 @@ export class ApiCallResolver {
   }
 
   private axiosInstanceInfo(node: ts.Expression): InstanceInfo | null {
-    if (!ts.isIdentifier(node)) return null;
+    // an identifier (`const http = axios.create()`) or a member (`this.http`).
+    if (!ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node)) return null;
     let sym = this.checker.getSymbolAtLocation(node);
     if (sym && sym.flags & ts.SymbolFlags.Alias) {
       try {
@@ -419,7 +878,10 @@ export class ApiCallResolver {
         if (baseExpr) baseUrl = this.constEval.evalString(baseExpr);
       }
       info = {
-        name: ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name) ? decl.name.text : null,
+        name:
+          (ts.isVariableDeclaration(decl) || ts.isPropertyDeclaration(decl)) && ts.isIdentifier(decl.name)
+            ? decl.name.text
+            : null,
         baseUrl,
         clientPackage: this.relOf(decl),
       };
@@ -432,7 +894,7 @@ export class ApiCallResolver {
   private axiosCreateInitOf(decl: ts.Node | undefined): ts.CallExpression | null {
     if (!decl) return null;
     let expr: ts.Expression | undefined;
-    if (ts.isVariableDeclaration(decl)) expr = decl.initializer;
+    if (ts.isVariableDeclaration(decl) || ts.isPropertyDeclaration(decl)) expr = decl.initializer;
     else if (ts.isExportAssignment(decl)) expr = decl.expression;
     if (!expr || !ts.isCallExpression(expr)) return null;
     if (

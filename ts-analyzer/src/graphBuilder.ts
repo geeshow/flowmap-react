@@ -90,6 +90,26 @@ export class GraphBuilder {
         module: f.module,
       });
     }
+    // Next.js route handler: an in-repo provider endpoint. Its id already encodes
+    // `ext:<METHOD> <path>`, so it merges with the consumer's API node.
+    if (c.kind === 'route-handler') {
+      return makeNode({
+        id: c.id,
+        fqcn: f.path,
+        method: c.providerMethod?.toLowerCase() ?? 'request',
+        layer: 'API',
+        httpMethod: c.providerMethod ?? null,
+        endpoint: c.providerEndpoint ?? null,
+        description: 'next-route-handler',
+        visibility: 'exported',
+        isAsync: c.isAsync,
+        file: f.path,
+        line: c.line,
+        project: f.project,
+        module: f.module,
+        confidence: 'resolved',
+      });
+    }
     const isScreen = this.screenPath.has(c.id);
     const layer: Layer = isScreen ? 'SCREEN' : c.kind === 'hook' ? 'HOOK' : 'COMPONENT';
     const routePath = this.screenPath.get(c.id) ?? null;

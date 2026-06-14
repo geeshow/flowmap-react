@@ -8,6 +8,30 @@
 /** Module specifiers whose default/`axios` export is an HTTP client. */
 export const AXIOS_MODULES = new Set(['axios']);
 
+/** SWR read-hook modules — `useSWR(key, fetcher)` treats `key` as the GET URL. */
+export const SWR_QUERY_MODULES = new Set(['swr', 'swr/immutable', 'swr/infinite']);
+
+/** SWR mutation module — `useSWRMutation(key, fetcher)`; `key` is the URL, write (POST). */
+export const SWR_MUTATION_MODULES = new Set(['swr/mutation']);
+
+/** graphql-request: `request(url, query)` and `new GraphQLClient(url).request(query)` (POST). */
+export const GRAPHQL_REQUEST_MODULES = new Set(['graphql-request']);
+
+/** Apollo Client: `new ApolloClient({ uri })` + useQuery/useMutation/... hooks (POST). */
+export const APOLLO_MODULES = new Set(['@apollo/client', '@apollo/client/react']);
+export const APOLLO_HOOKS = new Set(['useQuery', 'useMutation', 'useLazyQuery', 'useSubscription']);
+
+/** urql: `createClient({ url })` + useQuery/useMutation/useSubscription hooks (POST). */
+export const URQL_MODULES = new Set(['urql', '@urql/core', '@urql/react', '@urql/preact']);
+export const URQL_HOOKS = new Set(['useQuery', 'useMutation', 'useSubscription']);
+
+/** Other HTTP clients with the same `client.verb(url)` / `client(url, {method})` shape. */
+export const HTTP_CLIENT_MODULES = new Set(['ky', 'got', 'superagent']);
+
+/** Realtime clients: `io(url)` (socket.io-client). WebSocket/EventSource are browser
+ *  globals handled by call-shape, not import source. */
+export const REALTIME_CLIENT_MODULES = new Set(['socket.io-client']);
+
 /** HTTP verbs available as axios instance methods. */
 export const AXIOS_VERB_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'head', 'options']);
 
@@ -18,11 +42,38 @@ export const AXIOS_REQUEST_METHODS = new Set(['request']);
 export const ROUTER_ROUTE_TAGS = new Set(['Route']);
 export const ROUTER_FACTORY_FNS = new Set(['createBrowserRouter', 'createHashRouter', 'createMemoryRouter', 'useRoutes']);
 
+/** TanStack Router route-definition fns: `createRoute({...})` / `createRootRoute({...})`
+ *  (file routes use the curried `createFileRoute('/path')({...})`, handled separately). */
+export const TANSTACK_ROUTE_FNS = new Set(['createRoute', 'createRootRoute']);
+
 /** Redux Toolkit / Zustand / Context factory identifiers. */
 export const REDUX_SLICE_FN = 'createSlice';
 export const REDUX_ASYNC_THUNK_FN = 'createAsyncThunk';
 export const ZUSTAND_CREATE_FNS = new Set(['create', 'createStore']);
 export const CONTEXT_CREATE_FN = 'createContext';
+
+/** Jotai atom factories + read/write hooks. */
+export const JOTAI_MODULES = new Set(['jotai', 'jotai/utils', 'jotai/vanilla']);
+export const JOTAI_ATOM_FNS = new Set(['atom', 'atomWithStorage', 'atomWithDefault', 'atomWithReset', 'atomFamily']);
+export const JOTAI_HOOKS = new Set(['useAtom', 'useAtomValue', 'useSetAtom']);
+
+/** Recoil atom/selector factories + read/write hooks. */
+export const RECOIL_MODULES = new Set(['recoil']);
+export const RECOIL_ATOM_FNS = new Set(['atom', 'atomFamily', 'selector', 'selectorFamily']);
+export const RECOIL_HOOKS = new Set([
+  'useRecoilState',
+  'useRecoilValue',
+  'useSetRecoilState',
+  'useResetRecoilState',
+  'useRecoilValueLoadable',
+  'useRecoilStateLoadable',
+]);
+
+/** XState: createMachine + fromPromise/fromCallback actors + useMachine/useActor hooks. */
+export const XSTATE_MODULES = new Set(['xstate']);
+export const XSTATE_REACT_MODULES = new Set(['@xstate/react']);
+export const XSTATE_HOOKS = new Set(['useMachine', 'useActor', 'useActorRef']);
+export const XSTATE_ACTOR_FNS = new Set(['fromPromise', 'fromCallback', 'fromObservable', 'fromEventObservable']);
 
 /** Redux store hooks. */
 export const REDUX_HOOKS = new Set(['useSelector', 'useDispatch', 'useStore']);

@@ -1,6 +1,0 @@
-{
-  "env": {
-    "API_HOST": "https://api.shop.com",
-    "API_VERSION": "v1"
-  }
-}
