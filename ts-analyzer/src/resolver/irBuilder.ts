@@ -115,6 +115,16 @@ export class TsResolver implements Resolver {
       walker.walk({ comp: screen.comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
     }
 
+    // D2b. Next.js server actions referenced via `<form action={fn}>` — walk the
+    //      action body attributed to the referencing component (it isn't "called").
+    const walkedActions = new Set<string>();
+    for (const { comp, fn } of walker.serverActionRefs) {
+      const key = `${comp.id}::${fn.getSourceFile().fileName}:${fn.pos}`;
+      if (walkedActions.has(key)) continue;
+      walkedActions.add(key);
+      walker.walk({ comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
+    }
+
     // D3. Next.js route handlers (app/**/route.ts GET/POST..., pages/api default).
     //     Retag them as provider endpoints whose id is the consumer's `ext:<M> <path>`
     //     so the in-repo chain consumer → /api/foo → handler → upstream connects.
@@ -260,6 +270,10 @@ export class TsResolver implements Resolver {
 
 /** Walks a single component/hook body collecting render usages and calls. */
 class BodyWalker {
+  /** `<form action={serverAction}>` references discovered during the walk; their
+   *  bodies are walked afterward, attributed to the referencing component. */
+  readonly serverActionRefs: { comp: IrComponent; fn: ts.FunctionLikeDeclaration }[] = [];
+
   constructor(
     private readonly ctx: AnalysisContext,
     private readonly api: ApiCallResolver,
@@ -283,6 +297,7 @@ class BodyWalker {
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
         const usage = this.jsxUsage(node, sf);
         if (usage) m.comp.jsxUsages.push(usage);
+        this.collectServerActions(node, m.comp);
       }
 
       // calls
@@ -307,6 +322,33 @@ class BodyWalker {
     if (!isComponentName(simple)) return null; // native html element
     const resolved = this.ctx.resolveComponentRef(node.tagName as ts.Expression);
     return { tagName: tag, targetComponentId: resolved.id, lazy: resolved.lazy, line: lineOf(sf, node) };
+  }
+
+  /** `<form action={createPost}>` / `<button formAction={fn}>` where the referenced
+   *  function is a Next.js server action ('use server') → defer walking its body so
+   *  its HTTP calls are attributed to this component. */
+  private collectServerActions(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, comp: IrComponent): void {
+    for (const attr of node.attributes.properties) {
+      if (!ts.isJsxAttribute(attr)) continue;
+      const name = attr.name.getText(node.getSourceFile());
+      if (name !== 'action' && name !== 'formAction') continue;
+      if (!attr.initializer || !ts.isJsxExpression(attr.initializer) || !attr.initializer.expression) continue;
+      const ref = attr.initializer.expression;
+      if (!ts.isIdentifier(ref)) continue;
+      const fn = this.fnDeclOf(ref);
+      if (fn && isServerAction(fn)) this.serverActionRefs.push({ comp, fn });
+    }
+  }
+
+  private fnDeclOf(ref: ts.Identifier): ts.FunctionLikeDeclaration | null {
+    const sym = this.ctx.symbolAt(ref);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl) return null;
+    if (ts.isFunctionDeclaration(decl) && decl.body) return decl;
+    if (ts.isVariableDeclaration(decl) && decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
+      return decl.initializer;
+    }
+    return null;
   }
 
   private resolveCall(node: ts.CallExpression, inAsyncCtx: boolean, dispatchers: Set<ts.Symbol>, sf: ts.SourceFile): IrCall | null {
@@ -472,6 +514,18 @@ function bodyOf(owner: ts.Node): ts.Node | undefined {
 
 function isAsyncFn(node: ts.Node): boolean {
   return !!(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword));
+}
+
+/** A Next.js server action: a 'use server' directive at the top of the function body
+ *  or at the top of its source file. */
+function isServerAction(fn: ts.FunctionLikeDeclaration): boolean {
+  const useServer = (stmts: ts.NodeArray<ts.Statement> | undefined): boolean =>
+    !!stmts &&
+    stmts.some(
+      (s) => ts.isExpressionStatement(s) && ts.isStringLiteralLike(s.expression) && s.expression.text === 'use server',
+    );
+  if (fn.body && ts.isBlock(fn.body) && useServer(fn.body.statements)) return true;
+  return useServer(fn.getSourceFile().statements);
 }
 
 function hasExport(stmt: ts.Statement): boolean {

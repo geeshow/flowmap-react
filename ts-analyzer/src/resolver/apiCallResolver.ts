@@ -714,7 +714,27 @@ export class ApiCallResolver {
     if (!ts.isIdentifier(node)) return false;
     const sym = this.checker.getSymbolAtLocation(node);
     const mod = this.importModuleOf(sym);
-    return mod != null && AXIOS_MODULES.has(mod);
+    if (mod != null && AXIOS_MODULES.has(mod)) return true;
+    // dynamic: const axios = (await import('axios')).default
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (decl && ts.isVariableDeclaration(decl) && decl.initializer) return this.isDynamicAxiosExpr(decl.initializer);
+    return false;
+  }
+
+  /** `(await import('axios')).default` / `await import('axios')` → an axios binding. */
+  private isDynamicAxiosExpr(e: ts.Expression): boolean {
+    let expr = e;
+    if (ts.isPropertyAccessExpression(expr) && expr.name.text === 'default') expr = expr.expression;
+    while (ts.isParenthesizedExpression(expr) || ts.isAwaitExpression(expr)) {
+      expr = ts.isParenthesizedExpression(expr) ? expr.expression : expr.expression;
+    }
+    return (
+      ts.isCallExpression(expr) &&
+      expr.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      !!expr.arguments[0] &&
+      ts.isStringLiteralLike(expr.arguments[0]) &&
+      AXIOS_MODULES.has(expr.arguments[0].text)
+    );
   }
 
   /** If `node` is a default import of ky/got/superagent, its module name; else null. */
