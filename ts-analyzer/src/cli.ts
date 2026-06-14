@@ -454,12 +454,33 @@ async function cmdSearch(opts: Opts): Promise<void> {
 
 function cmdScreens(opts: Opts): void {
   const repo = opts.flags['--repo'] ?? '../.repo';
-  const doc = buildScreens({ repoRoot: repo, projectFilter: opts.flags['--project'] ?? null });
+  const out = opts.flags['--out'];
+  const project = opts.flags['--project'] ?? null;
+
+  // Mirror analyze: a split repo gets ONE screens doc per root, named to pair
+  // with that root's graph (`<name>-<root>.screens.json`), so the manifest links
+  // each per-root graph to its own screens. Single root → the plain `<out>`.
+  const roots = discoverProjectRoots(repo, project);
+  if (out && roots.length > 1) {
+    const repoRoot = path.resolve(repo);
+    const dir = path.dirname(out) || '.';
+    const stem = path.basename(out).replace(/\.screens\.json$/, '').replace(/\.json$/, '');
+    for (const root of roots) {
+      const doc = buildScreens({ repoRoot: repo, roots: [root] });
+      const outPath = path.join(dir, `${stem}-${serviceName(repoRoot, root)}.screens.json`);
+      fs.writeFileSync(outPath, jsonOutput.writeValue(doc));
+      process.stderr.write(`wrote ${outPath}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
+    }
+    refreshManifest(out);
+    return;
+  }
+
+  const doc = buildScreens({ repoRoot: repo, projectFilter: project });
   const text = jsonOutput.writeValue(doc);
-  if (opts.flags['--out']) {
-    fs.writeFileSync(opts.flags['--out'], text);
-    process.stderr.write(`wrote ${opts.flags['--out']}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
-    refreshManifest(opts.flags['--out']);
+  if (out) {
+    fs.writeFileSync(out, text);
+    process.stderr.write(`wrote ${out}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
+    refreshManifest(out);
   } else {
     process.stdout.write(text + '\n');
   }

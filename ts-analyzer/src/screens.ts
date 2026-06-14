@@ -57,9 +57,12 @@ interface Found {
   project: string | null;
 }
 
-export function buildScreens(opts: { repoRoot: string; projectFilter?: string | null }): ScreensDoc {
+export function buildScreens(opts: { repoRoot: string; projectFilter?: string | null; roots?: string[] }): ScreensDoc {
   const repoRoot = path.resolve(opts.repoRoot);
-  const projects = discoverProjects(repoRoot, opts.projectFilter);
+  // `roots` (explicit project dirs) lets a caller scan exactly one root for a
+  // per-root screens doc, aligned with the per-root graph split. Falls back to
+  // whole-repo discovery when not given.
+  const projects = opts.roots ?? discoverProjects(repoRoot, opts.projectFilter);
 
   const components: Record<string, ScreenComponent> = {};
   const screenRoute = new Map<string, string | null>(); // componentId -> route path
