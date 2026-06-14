@@ -220,13 +220,15 @@ export class TsResolver implements Resolver {
         if (meta) out.push(meta);
         continue;
       }
-      // const Foo = () => {} | function() {}
+      // const Foo = () => {} | function() {} | observer(() => {}) | memo(forwardRef(...))
       if (ts.isVariableStatement(stmt)) {
         for (const decl of stmt.declarationList.declarations) {
           if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
-          const init = decl.initializer;
-          if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) {
-            const meta = this.makeComp(decl.name.text, decl, init, sf, ctx, exported, isAsyncFn(init));
+          let fn: ts.ArrowFunction | ts.FunctionExpression | null = null;
+          if (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer)) fn = decl.initializer;
+          else if (ts.isCallExpression(decl.initializer)) fn = unwrapWrappedComponentFn(decl.initializer);
+          if (fn) {
+            const meta = this.makeComp(decl.name.text, decl, fn, sf, ctx, exported, isAsyncFn(fn));
             if (meta) out.push(meta);
           }
         }
@@ -295,9 +297,12 @@ class BodyWalker {
 
       // JSX render usage
       if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
-        const usage = this.jsxUsage(node, sf);
-        if (usage) m.comp.jsxUsages.push(usage);
-        else for (const u of this.dynamicTagUsages(node, sf)) m.comp.jsxUsages.push(u);
+        const dyn = this.dynamicTagUsages(node, sf);
+        if (dyn.length) for (const u of dyn) m.comp.jsxUsages.push(u);
+        else {
+          const usage = this.jsxUsage(node, sf);
+          if (usage) m.comp.jsxUsages.push(usage);
+        }
         this.collectServerActions(node, m.comp);
       }
 
@@ -305,6 +310,12 @@ class BodyWalker {
       if (ts.isCallExpression(node)) {
         const call = this.resolveCall(node, asyncDepth > 0, dispatchers, sf);
         if (call) m.comp.calls.push(call);
+      }
+
+      // realtime: new WebSocket(url) / new EventSource(url)
+      if (ts.isNewExpression(node)) {
+        const r = this.api.resolveNew(node);
+        if (r) m.comp.calls.push({ line: lineOf(sf, node), inAsyncCtx: asyncDepth > 0, resolution: r });
       }
 
       ts.forEachChild(node, visit);
@@ -360,6 +371,26 @@ class BodyWalker {
    */
   private dynamicTagUsages(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, sf: ts.SourceFile): IrJsxUsage[] {
     const tag = node.tagName;
+    // `<El/>` where `const El = cond ? A : B` (or `flag && A`) — emit an edge per branch.
+    if (ts.isIdentifier(tag)) {
+      if (!isComponentName(tag.text)) return [];
+      const sym = this.ctx.symbolAt(tag);
+      const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+      if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer) return [];
+      const init = decl.initializer;
+      if (!ts.isConditionalExpression(init) && !ts.isBinaryExpression(init)) return [];
+      const line = lineOf(sf, node);
+      const seen = new Set<string>();
+      const out: IrJsxUsage[] = [];
+      for (const branch of this.branchComponentExprs(init)) {
+        const r = this.ctx.resolveComponentRef(branch);
+        if (r.id && !seen.has(r.id)) {
+          seen.add(r.id);
+          out.push({ tagName: tag.text, targetComponentId: r.id, lazy: r.lazy, line });
+        }
+      }
+      return out;
+    }
     if (!ts.isPropertyAccessExpression(tag) || !ts.isIdentifier(tag.expression)) return [];
     if (!isComponentName(tag.name.text)) return []; // last segment must look like a component
     const propName = tag.name.text;
@@ -393,6 +424,32 @@ class BodyWalker {
         }
       }
     }
+    return out;
+  }
+
+  /** Component identifier expressions inside a ternary/logical (`cond ? A : B`,
+   *  `flag && A`, `a ?? B`) — recursing into nested conditionals. */
+  private branchComponentExprs(expr: ts.Expression): ts.Expression[] {
+    const out: ts.Expression[] = [];
+    const collect = (e: ts.Expression) => {
+      if (ts.isParenthesizedExpression(e)) return collect(e.expression);
+      if (ts.isConditionalExpression(e)) {
+        collect(e.whenTrue);
+        collect(e.whenFalse);
+        return;
+      }
+      if (ts.isBinaryExpression(e)) {
+        const op = e.operatorToken.kind;
+        if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.QuestionQuestionToken || op === ts.SyntaxKind.BarBarToken) {
+          collect(e.left);
+          collect(e.right);
+          return;
+        }
+        return;
+      }
+      if (ts.isIdentifier(e) && isComponentName(e.text)) out.push(e);
+    };
+    collect(expr);
     return out;
   }
 
@@ -579,6 +636,24 @@ function bodyOf(owner: ts.Node): ts.Node | undefined {
 
 function isAsyncFn(node: ts.Node): boolean {
   return !!(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword));
+}
+
+/** Component-wrapping HOCs whose inline-function argument is still a component body
+ *  to walk: `const X = observer(() => {...})`, `memo(forwardRef((p, ref) => {...}))`. */
+const COMPONENT_WRAPPER_FNS = new Set(['observer', 'memo', 'forwardRef']);
+
+function unwrapWrappedComponentFn(call: ts.CallExpression): ts.ArrowFunction | ts.FunctionExpression | null {
+  const callee = call.expression;
+  const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : null;
+  if (!name || !COMPONENT_WRAPPER_FNS.has(name)) return null;
+  for (const arg of call.arguments) {
+    if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) return arg;
+    if (ts.isCallExpression(arg)) {
+      const inner = unwrapWrappedComponentFn(arg);
+      if (inner) return inner;
+    }
+  }
+  return null;
 }
 
 /** A Next.js server action: a 'use server' directive at the top of the function body

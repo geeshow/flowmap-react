@@ -7,7 +7,7 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { NEXT_NON_SCREEN, ROUTER_FACTORY_FNS, ROUTER_ROUTE_TAGS } from '../classify';
+import { NEXT_NON_SCREEN, ROUTER_FACTORY_FNS, ROUTER_ROUTE_TAGS, TANSTACK_ROUTE_FNS } from '../classify';
 import type { IrRoute } from '../ir';
 import { AnalysisContext } from './context';
 
@@ -41,6 +41,23 @@ export function findReactRouterRoutes(sf: ts.SourceFile, ctx: AnalysisContext, d
         const resolved = resolveRoutesArray(arr, ctx);
         if (resolved) collectObjectRoutes(resolved, resolved.getSourceFile(), ctx, routes, dataFns);
       }
+    }
+    // TanStack Router: createRoute({ path, component, loader }) — object arg is a route.
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && TANSTACK_ROUTE_FNS.has(node.expression.text)) {
+      const arg = node.arguments[0];
+      if (arg && ts.isObjectLiteralExpression(arg)) parseRouteObject(arg, node, sf, ctx, routes, dataFns, null);
+    }
+    // TanStack Router file routes: createFileRoute('/path')({ component, loader }) — curried.
+    if (
+      ts.isCallExpression(node) &&
+      ts.isCallExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === 'createFileRoute'
+    ) {
+      const pathArg = node.expression.arguments[0];
+      const objArg = node.arguments[0];
+      const filePath = pathArg && ts.isStringLiteralLike(pathArg) ? pathArg.text : '';
+      if (objArg && ts.isObjectLiteralExpression(objArg)) parseRouteObject(objArg, node, sf, ctx, routes, dataFns, null, filePath);
     }
     ts.forEachChild(node, visit);
   };
@@ -133,16 +150,27 @@ function collectObjectRoutes(
   ctx: AnalysisContext,
   out: IrRoute[],
   dataFns?: RouteDataFn[],
+  parentPath = '',
 ): void {
   for (const el of arr.elements) {
     if (ts.isObjectLiteralExpression(el)) {
-      parseRouteObject(el, el, sf, ctx, out, dataFns, null);
+      parseRouteObject(el, el, sf, ctx, out, dataFns, null, parentPath);
     } else if (ts.isCallExpression(el)) {
       // route('/path', Component) factory element — inline its returned object literal.
       const factory = resolveRouteFactory(el, ctx);
-      if (factory) parseRouteObject(factory.obj, el, factory.obj.getSourceFile(), ctx, out, dataFns, factory.subst);
+      if (factory) parseRouteObject(factory.obj, el, factory.obj.getSourceFile(), ctx, out, dataFns, factory.subst, parentPath);
     }
   }
+}
+
+/** Join a child route segment onto its parent path (react-router nesting). An
+ *  absolute child (`/x`) replaces the parent; a relative one is appended; an index
+ *  or path-less child inherits the parent verbatim. */
+function joinRoutePath(parent: string, child: string | null, isIndex: boolean): string | null {
+  if (isIndex || child == null || child === '') return parent || null;
+  if (child.startsWith('/')) return child;
+  if (!parent) return '/' + child.replace(/^\/+/, '');
+  return parent.replace(/\/+$/, '') + '/' + child.replace(/^\/+/, '');
 }
 
 /** A `route(path, Comp)` factory call → its returned object literal + a param→arg map. */
@@ -194,11 +222,17 @@ function parseRouteObject(
   out: IrRoute[],
   dataFns: RouteDataFn[] | undefined,
   subst: Subst,
+  parentPath = '',
 ): void {
   let routePath: string | null = null;
+  let isIndex = false;
   let comp: { id: string | null; lazy: boolean } | null = null;
+  let childrenArr: ts.ArrayLiteralExpression | null = null;
   const routeFns: ts.FunctionLikeDeclaration[] = [];
   for (const p of el.properties) {
+    if (ts.isPropertyAssignment(p) && p.name.getText(sf) === 'index' && p.initializer.kind === ts.SyntaxKind.TrueKeyword) {
+      isIndex = true;
+    }
     // `{ path, Component }` shorthand resolves to the like-named param via subst.
     // A shorthand's value symbol is NOT getSymbolAtLocation(name) — use the checker's
     // dedicated lookup so it maps to the factory parameter, not the property itself.
@@ -232,13 +266,15 @@ function parseRouteObject(
       routeFns.push(p.initializer);
     }
     if (key === 'children' && ts.isArrayLiteralExpression(p.initializer)) {
-      collectObjectRoutes(p.initializer, sf, ctx, out, dataFns);
+      childrenArr = p.initializer;
     }
   }
+  const fullPath = joinRoutePath(parentPath, routePath, isIndex);
+  if (childrenArr) collectObjectRoutes(childrenArr, sf, ctx, out, dataFns, fullPath ?? parentPath);
   if (dataFns) for (const fn of routeFns) dataFns.push({ screenComponentId: comp?.id ?? null, fn });
-  if (routePath != null || comp?.id) {
+  if (fullPath != null || comp?.id) {
     out.push({
-      routePath,
+      routePath: fullPath,
       screenComponentId: comp?.id ?? null,
       lazy: comp?.lazy ?? false,
       source: 'react-router',

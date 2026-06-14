@@ -97,6 +97,16 @@ export class AnalysisContext {
       const hoc = this.resolveHocComponent(decl.expression);
       if (hoc) return { id: hoc, lazy: false };
     }
+    // compound component `<Tabs.Panel/>` where Panel comes from `Object.assign(Root, { Panel })`
+    // or `{ Panel: Foo }` — the member symbol resolves to the (shorthand) property; follow it.
+    if (ts.isShorthandPropertyAssignment(decl)) {
+      const vs = this.checker.getShorthandAssignmentValueSymbol(decl);
+      const vd = vs?.valueDeclaration ?? vs?.declarations?.[0];
+      if (vd) return { id: this.idOfDecl(vd), lazy: false };
+    }
+    if (ts.isPropertyAssignment(decl) && ts.isIdentifier(decl.initializer)) {
+      return this.resolveComponentRef(decl.initializer);
+    }
     const id = this.idOfDecl(decl);
     return { id, lazy: false };
   }

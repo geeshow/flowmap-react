@@ -14,13 +14,18 @@
 import * as path from 'path';
 import * as ts from 'typescript';
 import {
+  APOLLO_HOOKS,
+  APOLLO_MODULES,
   AXIOS_MODULES,
   AXIOS_REQUEST_METHODS,
   AXIOS_VERB_METHODS,
   GRAPHQL_REQUEST_MODULES,
   HTTP_CLIENT_MODULES,
+  REALTIME_CLIENT_MODULES,
   SWR_MUTATION_MODULES,
   SWR_QUERY_MODULES,
+  URQL_HOOKS,
+  URQL_MODULES,
   isComponentName,
   isHookName,
 } from '../classify';
@@ -55,6 +60,8 @@ export class ApiCallResolver {
   private readonly sourceFiles: ts.SourceFile[];
   /** callee symbol → its call sites across the project (lazily built). */
   private callSiteIndex: Map<ts.Symbol, ts.CallExpression[]> | null = null;
+  /** Project-wide GraphQL endpoint bases: the uri/url on the (singleton) client. */
+  private readonly graphqlBases: { apollo: EvalString | null; urql: EvalString | null };
 
   constructor(
     private readonly checker: ts.TypeChecker,
@@ -65,6 +72,7 @@ export class ApiCallResolver {
     this.projectFiles = new Set(sourceFiles.map((sf) => path.resolve(sf.fileName)));
     this.sourceFiles = sourceFiles;
     this.rtkHooks = this.buildRtkRegistry(sourceFiles);
+    this.graphqlBases = this.buildGraphqlBases(sourceFiles);
   }
 
   /** Resolve a call to an ApiResolution, or null if it is not an HTTP call. */
@@ -84,6 +92,23 @@ export class ApiCallResolver {
       return this.buildFromRaw(raw, call, []);
     }
     return this.traceWrapper(call, new Set());
+  }
+
+  /** `new WebSocket(url)` / `new EventSource(url)` — realtime external endpoints
+   *  (browser globals, detected by constructor name). */
+  resolveNew(node: ts.NewExpression): ApiResolution | null {
+    if (!ts.isIdentifier(node.expression)) return null;
+    const name = node.expression.text;
+    if (name !== 'WebSocket' && name !== 'EventSource') return null;
+    const raw: RawHttp = {
+      method: name === 'EventSource' ? 'GET' : null, // SSE is an HTTP GET; ws has no verb
+      verbConfident: name === 'EventSource',
+      urlExpr: node.arguments?.[0],
+      service: name === 'EventSource' ? 'sse' : 'websocket',
+      instanceBaseUrl: null,
+      clientPackage: null,
+    };
+    return this.buildFromRaw(raw, node as unknown as ts.CallExpression, []);
   }
 
   // ---- direct client classification ----
@@ -154,6 +179,18 @@ export class ApiCallResolver {
       if (callee.text === 'request' && mod && GRAPHQL_REQUEST_MODULES.has(mod)) {
         return { method: 'POST', verbConfident: true, urlExpr: call.arguments[0], service: 'graphql-request', instanceBaseUrl: null, clientPackage: null };
       }
+      // Apollo / urql hooks — the GraphQL endpoint lives on the project-singleton client
+      // (`new ApolloClient({uri})` / `createClient({url})`), not at the call site.
+      if (mod && APOLLO_MODULES.has(mod) && APOLLO_HOOKS.has(callee.text) && this.graphqlBases.apollo) {
+        return this.graphqlBaseRaw(this.graphqlBases.apollo, 'apollo');
+      }
+      if (mod && URQL_MODULES.has(mod) && URQL_HOOKS.has(callee.text) && this.graphqlBases.urql) {
+        return this.graphqlBaseRaw(this.graphqlBases.urql, 'urql');
+      }
+      // socket.io-client: io(url) / connect(url) — a realtime (ws) external endpoint.
+      if ((callee.text === 'io' || callee.text === 'connect') && mod && REALTIME_CLIENT_MODULES.has(mod)) {
+        return { method: null, verbConfident: false, urlExpr: call.arguments[0], service: 'socket.io', instanceBaseUrl: null, clientPackage: mod };
+      }
     }
 
     // recv.method(...)
@@ -166,6 +203,11 @@ export class ApiCallResolver {
         if (gqlBase) {
           return { method: 'POST', verbConfident: true, urlExpr: undefined, service: 'graphql-request', instanceBaseUrl: gqlBase, clientPackage: null };
         }
+      }
+      // Apollo imperative: const c = new ApolloClient({uri}); c.query/.mutate/.subscribe(...) — POST.
+      if (method === 'query' || method === 'mutate' || method === 'subscribe') {
+        const apolloBase = this.apolloClientBaseUrl(recv);
+        if (apolloBase) return { method: 'POST', verbConfident: true, urlExpr: undefined, service: 'apollo', instanceBaseUrl: apolloBase, clientPackage: null };
       }
       // ky/got/superagent: client.get/post(url) (verb chains like .send() wrap this inner call)
       const client = this.httpClientName(recv);
@@ -233,6 +275,60 @@ export class ApiCallResolver {
     if (!body) return null;
     const inner = this.findInnerHttpCall(body);
     return inner && inner.raw.verbConfident ? inner.raw.method : null;
+  }
+
+  /** A GraphQL hook (apollo/urql) call → POST to the project client's endpoint. */
+  private graphqlBaseRaw(base: EvalString, service: string): RawHttp {
+    return { method: 'POST', verbConfident: true, urlExpr: undefined, service, instanceBaseUrl: base, clientPackage: null };
+  }
+
+  /** Scan the project once for the GraphQL endpoint base: `new ApolloClient({uri})` /
+   *  `new HttpLink({uri})` / `createHttpLink({uri})` (apollo) and `createClient({url})` (urql). */
+  private buildGraphqlBases(sourceFiles: ts.SourceFile[]): { apollo: EvalString | null; urql: EvalString | null } {
+    let apollo: EvalString | null = null;
+    let urql: EvalString | null = null;
+    const uriOf = (argsHost: ts.NewExpression | ts.CallExpression, key: string): EvalString | null => {
+      const arg = argsHost.arguments?.[0];
+      if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
+      const e = this.propExpr(arg, key);
+      return e ? this.constEval.evalString(e) : null;
+    };
+    for (const sf of sourceFiles) {
+      const visit = (node: ts.Node) => {
+        if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)) {
+          const name = node.expression.text;
+          const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node.expression));
+          if (!apollo && (name === 'ApolloClient' || name === 'HttpLink') && mod && APOLLO_MODULES.has(mod)) {
+            apollo = uriOf(node, 'uri') ?? apollo;
+          }
+        }
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+          const name = node.expression.text;
+          const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node.expression));
+          if (!apollo && name === 'createHttpLink' && mod && APOLLO_MODULES.has(mod)) apollo = uriOf(node, 'uri') ?? apollo;
+          if (!urql && name === 'createClient' && mod && URQL_MODULES.has(mod)) urql = uriOf(node, 'url') ?? urql;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return { apollo, urql };
+  }
+
+  /** baseUrl of `const c = new ApolloClient({ uri })` (@apollo/client), or null. */
+  private apolloClientBaseUrl(node: ts.Expression): EvalString | null {
+    if (!ts.isIdentifier(node)) return null;
+    const sym = this.checker.getSymbolAtLocation(node);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isVariableDeclaration(decl) || !decl.initializer || !ts.isNewExpression(decl.initializer)) return null;
+    const ne = decl.initializer;
+    if (!ts.isIdentifier(ne.expression) || ne.expression.text !== 'ApolloClient') return null;
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(ne.expression));
+    if (!mod || !APOLLO_MODULES.has(mod)) return null;
+    const arg = ne.arguments?.[0];
+    if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
+    const uri = this.propExpr(arg, 'uri');
+    return uri ? this.constEval.evalString(uri) : null;
   }
 
   /** baseUrl of `const c = new GraphQLClient(url)` (graphql-request), or null. */

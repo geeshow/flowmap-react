@@ -17,8 +17,20 @@ export const SWR_MUTATION_MODULES = new Set(['swr/mutation']);
 /** graphql-request: `request(url, query)` and `new GraphQLClient(url).request(query)` (POST). */
 export const GRAPHQL_REQUEST_MODULES = new Set(['graphql-request']);
 
+/** Apollo Client: `new ApolloClient({ uri })` + useQuery/useMutation/... hooks (POST). */
+export const APOLLO_MODULES = new Set(['@apollo/client', '@apollo/client/react']);
+export const APOLLO_HOOKS = new Set(['useQuery', 'useMutation', 'useLazyQuery', 'useSubscription']);
+
+/** urql: `createClient({ url })` + useQuery/useMutation/useSubscription hooks (POST). */
+export const URQL_MODULES = new Set(['urql', '@urql/core', '@urql/react', '@urql/preact']);
+export const URQL_HOOKS = new Set(['useQuery', 'useMutation', 'useSubscription']);
+
 /** Other HTTP clients with the same `client.verb(url)` / `client(url, {method})` shape. */
 export const HTTP_CLIENT_MODULES = new Set(['ky', 'got', 'superagent']);
+
+/** Realtime clients: `io(url)` (socket.io-client). WebSocket/EventSource are browser
+ *  globals handled by call-shape, not import source. */
+export const REALTIME_CLIENT_MODULES = new Set(['socket.io-client']);
 
 /** HTTP verbs available as axios instance methods. */
 export const AXIOS_VERB_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'head', 'options']);
@@ -29,6 +41,10 @@ export const AXIOS_REQUEST_METHODS = new Set(['request']);
 /** react-router route container / definition identifiers. */
 export const ROUTER_ROUTE_TAGS = new Set(['Route']);
 export const ROUTER_FACTORY_FNS = new Set(['createBrowserRouter', 'createHashRouter', 'createMemoryRouter', 'useRoutes']);
+
+/** TanStack Router route-definition fns: `createRoute({...})` / `createRootRoute({...})`
+ *  (file routes use the curried `createFileRoute('/path')({...})`, handled separately). */
+export const TANSTACK_ROUTE_FNS = new Set(['createRoute', 'createRootRoute']);
 
 /** Redux Toolkit / Zustand / Context factory identifiers. */
 export const REDUX_SLICE_FN = 'createSlice';
