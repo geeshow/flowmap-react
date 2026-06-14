@@ -52,6 +52,9 @@ export class ApiCallResolver {
   private readonly projectFiles: Set<string>;
   /** RTK Query generated-hook name → resolved endpoint (built once from createApi). */
   private readonly rtkHooks: Map<string, ApiResolution>;
+  private readonly sourceFiles: ts.SourceFile[];
+  /** callee symbol → its call sites across the project (lazily built). */
+  private callSiteIndex: Map<ts.Symbol, ts.CallExpression[]> | null = null;
 
   constructor(
     private readonly checker: ts.TypeChecker,
@@ -60,6 +63,7 @@ export class ApiCallResolver {
     sourceFiles: ts.SourceFile[],
   ) {
     this.projectFiles = new Set(sourceFiles.map((sf) => path.resolve(sf.fileName)));
+    this.sourceFiles = sourceFiles;
     this.rtkHooks = this.buildRtkRegistry(sourceFiles);
   }
 
@@ -71,7 +75,14 @@ export class ApiCallResolver {
       if (hit) return hit;
     }
     const raw = this.classifyHttpCall(call);
-    if (raw) return this.buildFromRaw(raw, call, []);
+    if (raw) {
+      // A url that is an unbound parameter of the ENCLOSING function (a custom data
+      // hook like `useApi(url) → useQuery(() => axios.get(url))`) can't resolve from
+      // the definition alone. Bind it from the hook's call sites when they agree.
+      const bound = this.bindUrlFromCallSites(raw.urlExpr);
+      if (bound) return this.buildFromRaw({ ...raw, urlExpr: bound }, call, []);
+      return this.buildFromRaw(raw, call, []);
+    }
     return this.traceWrapper(call, new Set());
   }
 
@@ -405,6 +416,81 @@ export class ApiCallResolver {
       }
     }
     return null;
+  }
+
+  /**
+   * When `urlExpr` is a bare parameter of its enclosing function, infer the URL from
+   * that function's call sites: if every call passes the same resolved literal at the
+   * param position, bind it. Returns null when the param has zero or conflicting args.
+   */
+  private bindUrlFromCallSites(urlExpr: ts.Expression | undefined): ts.Expression | null {
+    if (!urlExpr || !ts.isIdentifier(urlExpr)) return null;
+    const sym = this.checker.getSymbolAtLocation(urlExpr);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!decl || !ts.isParameter(decl)) return null;
+    const fn = decl.parent;
+    if (!this.isFunctionLike(fn)) return null;
+    const pIdx = fn.parameters.indexOf(decl);
+    if (pIdx < 0) return null;
+    const fnSym = this.declaredFnSymbol(fn);
+    if (!fnSym) return null;
+
+    const distinct = new Map<string, ts.Expression>();
+    for (const site of this.callSitesOf(fnSym)) {
+      const arg = site.arguments[pIdx];
+      if (!arg) continue;
+      const ev = this.constEval.evalString(arg);
+      if (ev.value != null && !ev.hasPlaceholder) distinct.set(ev.value, arg);
+    }
+    return distinct.size === 1 ? [...distinct.values()][0] : null;
+  }
+
+  private isFunctionLike(node: ts.Node): node is ts.FunctionLikeDeclaration {
+    return (
+      ts.isFunctionDeclaration(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isMethodDeclaration(node)
+    );
+  }
+
+  /** The symbol naming a function declaration / `const f = () => …`, for call-site lookup. */
+  private declaredFnSymbol(fn: ts.FunctionLikeDeclaration): ts.Symbol | undefined {
+    if ((ts.isFunctionDeclaration(fn) || ts.isMethodDeclaration(fn)) && fn.name) return this.checker.getSymbolAtLocation(fn.name);
+    if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && ts.isVariableDeclaration(fn.parent) && ts.isIdentifier(fn.parent.name)) {
+      return this.checker.getSymbolAtLocation(fn.parent.name);
+    }
+    return undefined;
+  }
+
+  /** Call sites of a function symbol across the project (index built once). */
+  private callSitesOf(fnSym: ts.Symbol): ts.CallExpression[] {
+    if (!this.callSiteIndex) {
+      this.callSiteIndex = new Map();
+      for (const sf of this.sourceFiles) {
+        const visit = (node: ts.Node) => {
+          if (ts.isCallExpression(node) && (ts.isIdentifier(node.expression) || ts.isPropertyAccessExpression(node.expression))) {
+            const target = ts.isIdentifier(node.expression) ? node.expression : node.expression.name;
+            let s = this.checker.getSymbolAtLocation(target);
+            if (s && s.flags & ts.SymbolFlags.Alias) {
+              try {
+                s = this.checker.getAliasedSymbol(s);
+              } catch {
+                /* not an alias */
+              }
+            }
+            if (s) {
+              const arr = this.callSiteIndex!.get(s);
+              if (arr) arr.push(node);
+              else this.callSiteIndex!.set(s, [node]);
+            }
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(sf);
+      }
+    }
+    return this.callSiteIndex.get(fnSym) ?? [];
   }
 
   /** A destructured-param binding (`fn({ url })` / `fn({ url: u })`) → caller's object property. */

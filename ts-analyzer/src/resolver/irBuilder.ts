@@ -29,7 +29,8 @@ import { ConstantEvaluator } from './constantEvaluator';
 import { AnalysisContext } from './context';
 import { EnvResolver } from './envResolver';
 import { buildProjectProgram, discoverProjects, isNextProject, provenance, repoRel } from './program';
-import { findNextRoutes, findReactRouterRoutes, RouteDataFn } from './routeResolver';
+import { NEXT_HANDLER_VERBS, findNextRoutes, findReactRouterRoutes, nextRouteHandlerPath, RouteDataFn } from './routeResolver';
+import { normalize } from '../norm';
 import { StoreAccumulator, collectStores, emptyAccumulator } from './storeResolver';
 
 interface CompMeta {
@@ -114,8 +115,38 @@ export class TsResolver implements Resolver {
       walker.walk({ comp: screen.comp, decl: fn, bodyOwner: fn, file: fn.getSourceFile() });
     }
 
+    // D3. Next.js route handlers (app/**/route.ts GET/POST..., pages/api default).
+    //     Retag them as provider endpoints whose id is the consumer's `ext:<M> <path>`
+    //     so the in-repo chain consumer → /api/foo → handler → upstream connects.
+    if (nextProject) this.tagRouteHandlers(metas, projectRoot);
+
     // assemble IrFile per source file
     return this.assembleFiles(pp.sourceFiles, repoRoot, metas, stores.stores, routesByFile, ctx);
+  }
+
+  /**
+   * Retag Next.js route-handler functions (already discovered as components because
+   * GET/POST are PascalCase) as provider endpoints. Their id becomes the consumer's
+   * `ext:<METHOD> <path>` so graphBuilder merges the two and the in-repo chain
+   * (consumer → /api/foo → handler → upstream) connects.
+   */
+  private tagRouteHandlers(metas: CompMeta[], projectRoot: string): void {
+    for (const m of metas) {
+      const c = m.comp;
+      if (c.kind !== 'component') continue;
+      const rel = path.relative(projectRoot, m.file.fileName).split(path.sep).join('/');
+      const epPath = nextRouteHandlerPath(rel);
+      if (epPath == null) continue;
+      let method: string | null;
+      if (NEXT_HANDLER_VERBS.has(c.name)) method = c.name; // App Router named verb export
+      else if (c.name === 'default') method = null; // pages/api catch-all handler
+      else continue;
+      const ep = normalize(epPath) || '/';
+      c.kind = 'route-handler';
+      c.providerEndpoint = ep;
+      c.providerMethod = method;
+      c.id = `ext:${method ?? 'ANY'} ${ep}`;
+    }
   }
 
   private assembleFiles(

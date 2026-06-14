@@ -94,17 +94,32 @@ function componentFromAttrInitializer(init: ts.JsxAttributeValue, ctx: AnalysisC
   return { id: null, lazy: false };
 }
 
+/** Maps a route-factory's parameter symbols to the call-site argument expressions,
+ *  so `route(path, Component)` returning `{ path, Component }` can be inlined. */
+type Subst = Map<ts.Symbol, ts.Expression> | null;
+
+/** Replace a parameter identifier with the matching call-site argument, per `subst`. */
+function applySubst(expr: ts.Expression, subst: Subst, ctx: AnalysisContext): ts.Expression {
+  if (!subst || !ts.isIdentifier(expr)) return expr;
+  const sym = ctx.symbolAt(expr);
+  return sym && subst.has(sym) ? subst.get(sym)! : expr;
+}
+
 /** Resolve a route element's screen component, descending through wrapper tags
  *  (`<Suspense fallback={...}><Page/></Suspense>`, fragments) whose own tag does
  *  not resolve to a project component. */
-function screenFromJsx(node: ts.JsxElement | ts.JsxSelfClosingElement, ctx: AnalysisContext): { id: string | null; lazy: boolean } {
+function screenFromJsx(
+  node: ts.JsxElement | ts.JsxSelfClosingElement,
+  ctx: AnalysisContext,
+  subst: Subst = null,
+): { id: string | null; lazy: boolean } {
   const tag = ts.isJsxElement(node) ? node.openingElement.tagName : node.tagName;
-  const direct = ctx.resolveComponentRef(tag as ts.Expression);
+  const direct = ctx.resolveComponentRef(applySubst(tag as ts.Expression, subst, ctx));
   if (direct.id) return direct;
   if (ts.isJsxElement(node)) {
     for (const child of node.children) {
       if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child)) {
-        const inner = screenFromJsx(child, ctx);
+        const inner = screenFromJsx(child, ctx, subst);
         if (inner.id) return inner;
       }
     }
@@ -120,45 +135,115 @@ function collectObjectRoutes(
   dataFns?: RouteDataFn[],
 ): void {
   for (const el of arr.elements) {
-    if (!ts.isObjectLiteralExpression(el)) continue;
-    let routePath: string | null = null;
-    let comp: { id: string | null; lazy: boolean } | null = null;
-    const routeFns: ts.FunctionLikeDeclaration[] = [];
-    for (const p of el.properties) {
-      if (!ts.isPropertyAssignment(p)) continue;
-      const key = p.name.getText(sf);
-      if (key === 'path' && ts.isStringLiteralLike(p.initializer)) routePath = p.initializer.text;
-      if (key === 'element') {
-        const e = p.initializer;
-        if (ts.isJsxSelfClosingElement(e) || ts.isJsxElement(e)) {
-          comp = screenFromJsx(e, ctx);
-        }
-      }
-      if ((key === 'Component' || key === 'component') && ts.isIdentifier(p.initializer)) {
-        comp = ctx.resolveComponentRef(p.initializer);
-      }
-      if (key === 'lazy') {
-        // lazy: () => import('./Page') → resolve the module's Component/default export.
-        const lazyId = ctx.resolveRouteLazyModule(p.initializer);
-        comp = { id: lazyId ?? comp?.id ?? null, lazy: true };
-      }
-      if ((key === 'loader' || key === 'action') && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer))) {
-        routeFns.push(p.initializer);
-      }
-      if (key === 'children' && ts.isArrayLiteralExpression(p.initializer)) {
-        collectObjectRoutes(p.initializer, sf, ctx, out, dataFns);
+    if (ts.isObjectLiteralExpression(el)) {
+      parseRouteObject(el, el, sf, ctx, out, dataFns, null);
+    } else if (ts.isCallExpression(el)) {
+      // route('/path', Component) factory element — inline its returned object literal.
+      const factory = resolveRouteFactory(el, ctx);
+      if (factory) parseRouteObject(factory.obj, el, factory.obj.getSourceFile(), ctx, out, dataFns, factory.subst);
+    }
+  }
+}
+
+/** A `route(path, Comp)` factory call → its returned object literal + a param→arg map. */
+function resolveRouteFactory(call: ts.CallExpression, ctx: AnalysisContext): { obj: ts.ObjectLiteralExpression; subst: Subst } | null {
+  const sym = ctx.symbolAt(call.expression);
+  const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+  let fn: ts.FunctionLikeDeclaration | undefined;
+  if (decl && ts.isFunctionDeclaration(decl)) fn = decl;
+  else if (decl && ts.isVariableDeclaration(decl) && decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
+    fn = decl.initializer;
+  }
+  if (!fn || !fn.body) return null;
+
+  // The returned object literal: concise arrow `=> ({...})` or a block's `return {...}`.
+  let obj: ts.ObjectLiteralExpression | undefined;
+  if (ts.isBlock(fn.body)) {
+    for (const st of fn.body.statements) {
+      if (ts.isReturnStatement(st) && st.expression) {
+        let e: ts.Expression = st.expression;
+        while (ts.isParenthesizedExpression(e)) e = e.expression;
+        if (ts.isObjectLiteralExpression(e)) obj = e;
+        break;
       }
     }
-    if (dataFns) for (const fn of routeFns) dataFns.push({ screenComponentId: comp?.id ?? null, fn });
-    if (routePath != null || comp?.id) {
-      out.push({
-        routePath,
-        screenComponentId: comp?.id ?? null,
-        lazy: comp?.lazy ?? false,
-        source: 'react-router',
-        line: lineOf(sf, el),
-      });
+  } else {
+    let e: ts.Expression = fn.body;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (ts.isObjectLiteralExpression(e)) obj = e;
+  }
+  if (!obj) return null;
+
+  const subst: Map<ts.Symbol, ts.Expression> = new Map();
+  fn.parameters.forEach((param, i) => {
+    if (ts.isIdentifier(param.name) && call.arguments[i]) {
+      const psym = ctx.symbolAt(param.name);
+      if (psym) subst.set(psym, call.arguments[i]);
     }
+  });
+  return { obj, subst };
+}
+
+/** Parse one route object literal (possibly a factory's return, with `subst`).
+ *  `lineNode` is where the route is reported from (the array element). */
+function parseRouteObject(
+  el: ts.ObjectLiteralExpression,
+  lineNode: ts.Node,
+  sf: ts.SourceFile,
+  ctx: AnalysisContext,
+  out: IrRoute[],
+  dataFns: RouteDataFn[] | undefined,
+  subst: Subst,
+): void {
+  let routePath: string | null = null;
+  let comp: { id: string | null; lazy: boolean } | null = null;
+  const routeFns: ts.FunctionLikeDeclaration[] = [];
+  for (const p of el.properties) {
+    // `{ path, Component }` shorthand resolves to the like-named param via subst.
+    // A shorthand's value symbol is NOT getSymbolAtLocation(name) — use the checker's
+    // dedicated lookup so it maps to the factory parameter, not the property itself.
+    if (ts.isShorthandPropertyAssignment(p)) {
+      const key = p.name.text;
+      const valSym = subst ? ctx.checker.getShorthandAssignmentValueSymbol(p) : undefined;
+      const val: ts.Expression = valSym && subst!.has(valSym) ? subst!.get(valSym)! : p.name;
+      if (key === 'path' && ts.isStringLiteralLike(val)) routePath = val.text;
+      if ((key === 'Component' || key === 'component') && ts.isIdentifier(val)) comp = ctx.resolveComponentRef(val);
+      continue;
+    }
+    if (!ts.isPropertyAssignment(p)) continue;
+    const key = p.name.getText(sf);
+    if (key === 'path') {
+      const val = applySubst(p.initializer, subst, ctx);
+      if (ts.isStringLiteralLike(val)) routePath = val.text;
+    }
+    if (key === 'element') {
+      const e = p.initializer;
+      if (ts.isJsxSelfClosingElement(e) || ts.isJsxElement(e)) comp = screenFromJsx(e, ctx, subst);
+    }
+    if ((key === 'Component' || key === 'component') && ts.isIdentifier(p.initializer)) {
+      comp = ctx.resolveComponentRef(applySubst(p.initializer, subst, ctx));
+    }
+    if (key === 'lazy') {
+      // lazy: () => import('./Page') → resolve the module's Component/default export.
+      const lazyId = ctx.resolveRouteLazyModule(p.initializer);
+      comp = { id: lazyId ?? comp?.id ?? null, lazy: true };
+    }
+    if ((key === 'loader' || key === 'action') && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer))) {
+      routeFns.push(p.initializer);
+    }
+    if (key === 'children' && ts.isArrayLiteralExpression(p.initializer)) {
+      collectObjectRoutes(p.initializer, sf, ctx, out, dataFns);
+    }
+  }
+  if (dataFns) for (const fn of routeFns) dataFns.push({ screenComponentId: comp?.id ?? null, fn });
+  if (routePath != null || comp?.id) {
+    out.push({
+      routePath,
+      screenComponentId: comp?.id ?? null,
+      lazy: comp?.lazy ?? false,
+      source: 'react-router',
+      line: lineOf(lineNode.getSourceFile(), lineNode),
+    });
   }
 }
 
@@ -206,6 +291,38 @@ export function nextRouteInfo(rel: string): NextInfo | null {
     const segs = rest.slice(0, -1);
     if (fileName !== 'index') segs.push(fileName);
     return { routePath: toRoutePath(segs), source: 'next-pages' };
+  }
+
+  return null;
+}
+
+/** Export names a Next.js route handler / API route may define. */
+export const NEXT_HANDLER_VERBS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+
+/**
+ * The served endpoint path for a Next.js route handler file, or null if the file
+ * is not one. Handles App Router `app/**​/route.(ts|tsx|js|jsx)` and Pages Router
+ * `pages/api/**`. Dynamic segments ([id], [...slug]) collapse to "{}".
+ */
+export function nextRouteHandlerPath(rel: string): string | null {
+  const parts = rel.split('/');
+  const srcless = parts[0] === 'src' ? parts.slice(1) : parts;
+
+  // App Router: app/**/route.(t|j)sx?
+  if (srcless[0] === 'app') {
+    const file = srcless[srcless.length - 1];
+    if (!/^route\.(t|j)sx?$/.test(file)) return null;
+    const segs = srcless.slice(1, -1).filter((s) => !/^\(.*\)$/.test(s)); // strip route groups
+    return toRoutePath(segs);
+  }
+
+  // Pages Router API routes: pages/api/**
+  if (srcless[0] === 'pages' && srcless[1] === 'api') {
+    const rest = srcless.slice(1); // includes 'api'
+    const fileName = rest[rest.length - 1].replace(/\.(t|j)sx?$/, '');
+    const segs = rest.slice(0, -1);
+    if (fileName !== 'index') segs.push(fileName);
+    return toRoutePath(segs);
   }
 
   return null;

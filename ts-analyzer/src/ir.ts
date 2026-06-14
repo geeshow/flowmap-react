@@ -7,7 +7,7 @@
 
 import type { Confidence } from './model';
 
-export type ComponentKind = 'component' | 'hook' | 'function' | 'action';
+export type ComponentKind = 'component' | 'hook' | 'function' | 'action' | 'route-handler';
 export type StoreKind = 'redux-slice' | 'zustand' | 'context' | 'vuex' | 'jotai' | 'recoil';
 export type RouteSource = 'react-router' | 'next-pages' | 'next-app' | 'nuxt-pages';
 
@@ -54,6 +54,9 @@ export interface IrComponent {
   line: number | null;
   jsxUsages: IrJsxUsage[]; // children rendered
   calls: IrCall[]; // resolved call sites
+  // For kind 'route-handler' (Next.js app/**/route.ts, pages/api): the served endpoint.
+  providerEndpoint?: string | null;
+  providerMethod?: string | null;
 }
 
 export interface IrRoute {
