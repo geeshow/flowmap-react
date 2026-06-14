@@ -30,6 +30,8 @@ export interface RawHttp {
   method: string | null;
   verbConfident: boolean;
   urlExpr: ts.Expression | undefined;
+  /** The `method` config expression (for binding a wrapper's `cfg.method` to the caller). */
+  methodExpr?: ts.Expression | undefined;
   service: string | null;
   instanceBaseUrl: EvalString | null;
   clientPackage: string | null;
@@ -117,13 +119,16 @@ export class ApiCallResolver {
     const cfg = call.arguments[0];
     const m = this.methodFromConfig(cfg);
     let urlExpr: ts.Expression | undefined;
+    let methodExpr: ts.Expression | undefined;
     if (cfg && ts.isObjectLiteralExpression(cfg)) {
       urlExpr = this.propExpr(cfg, 'url');
+      methodExpr = this.propExpr(cfg, 'method');
     }
     return {
       method: m ?? 'GET',
       verbConfident: m != null,
       urlExpr,
+      methodExpr,
       service: inst.name ?? 'axios',
       instanceBaseUrl: inst.baseUrl,
       clientPackage: inst.clientPackage,
@@ -177,7 +182,25 @@ export class ApiCallResolver {
       // a positional one (`fn(url)`), a destructured one (`fn({ url })`), or a config-object
       // property (`fn(cfg)` → `cfg.url`). Otherwise keep the literal URL from the wrapper body.
       const bound = this.bindParamExpr(raw.urlExpr, decl, call);
-      const boundRaw: RawHttp = { ...raw, urlExpr: bound ?? raw.urlExpr, service: calleeName ?? raw.service };
+      // Bind the wrapper's `cfg.method` to the caller's `method` property too, so a generic
+      // `request({ url, method })` wrapper carries the verb from its call site.
+      let method = raw.method;
+      let verbConfident = raw.verbConfident;
+      const boundMethod = this.bindParamExpr(raw.methodExpr, decl, call);
+      if (boundMethod) {
+        const mv = this.constEval.evalString(boundMethod);
+        if (mv.value && !mv.hasPlaceholder) {
+          method = mv.value.toUpperCase();
+          verbConfident = true;
+        }
+      }
+      const boundRaw: RawHttp = {
+        ...raw,
+        urlExpr: bound ?? raw.urlExpr,
+        method,
+        verbConfident,
+        service: calleeName ?? raw.service,
+      };
       const innerMethodName = this.calleeName(inner.call.expression) ?? raw.service ?? 'http';
       return this.buildFromRaw(boundRaw, call, [calleeName ?? '?', innerMethodName]);
     }

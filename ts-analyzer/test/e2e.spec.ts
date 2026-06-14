@@ -123,3 +123,55 @@ describe('e2e on sample-shop-react', () => {
     expect(r.meta.matched).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe('e2e on shopflow-web (deep var/const/substituted chains)', () => {
+  const files = new TsResolver().analyze({ repoRoot: REPO, projectFilter: 'shopflow-web' });
+  const g = new GraphBuilder(files).build();
+  const httpNodes = g.nodes.filter((n) => n.layer === 'API' || n.layer === 'EXTERNAL');
+  const ep = (method: string, endpoint: string) =>
+    httpNodes.find((n) => n.httpMethod === method && n.endpoint === endpoint);
+
+  it('resolves every gateway endpoint to its normalized form with confidence=resolved', () => {
+    const expected: Array<[string, string]> = [
+      ['POST', '/user/v1/users'],
+      ['GET', '/user/v1/users/{}/profile'],
+      ['POST', '/order/v1/orders'],
+      ['GET', '/order/v1/orders'],
+      ['GET', '/order/v1/orders/{}'],
+      ['POST', '/payment/v1/payments'],
+      ['GET', '/payment/v1/payments/{}'],
+      ['GET', '/catalog/v1/catalog/items'],
+      ['GET', '/catalog/v1/catalog/items/{}'],
+    ];
+    for (const [m, e] of expected) {
+      const n = ep(m, e);
+      expect(n, `${m} ${e}`).toBeTruthy();
+      expect(n!.confidence, `${m} ${e} confidence`).toBe('resolved');
+      expect(n!.urlPlaceholder, `${m} ${e} placeholder`).toBeFalsy();
+    }
+  });
+
+  it('binds the HTTP verb through a generic request({ url, method }) wrapper', () => {
+    // createUser → request({ url, method: 'POST' }) → http.request(cfg) reads cfg.method.
+    expect(ep('POST', '/user/v1/users')).toBeTruthy();
+  });
+
+  it('folds a function-valued path const call, e.g. (id) => `/v1/orders/${id}` → /{}', () => {
+    expect(ep('GET', '/order/v1/orders/{}')).toBeTruthy();
+    expect(ep('GET', '/catalog/v1/catalog/items/{}')).toBeTruthy();
+  });
+
+  it('resolves a substituted-variable URL indirection (const path = ORDER_PATHS.LIST)', () => {
+    const list = ep('GET', '/order/v1/orders');
+    expect(list).toBeTruthy();
+    expect(list!.externalUrl).toBe('https://gw.shopflow.io/order/v1/orders');
+  });
+
+  it('traces a redux createAsyncThunk body to its API (dispatch → thunk → apiWrapper → http)', () => {
+    const thunk = g.nodes.find((n) => n.id === 'store:redux:order#placeOrder');
+    expect(thunk).toBeTruthy();
+    const fromThunk = g.edges.filter((e) => e.source === thunk!.id && e.target.startsWith('ext:'));
+    expect(fromThunk.length).toBeGreaterThan(0);
+    expect(fromThunk[0].target).toContain('/order/v1/orders');
+  });
+});

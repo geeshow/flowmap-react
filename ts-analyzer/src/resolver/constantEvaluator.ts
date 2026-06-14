@@ -55,7 +55,52 @@ export class ConstantEvaluator {
 
     if (ts.isIdentifier(node)) return this.evalIdentifier(node, depth);
 
+    // Call to a const/path-builder function, e.g. `ORDER_PATHS.DETAIL(id)` or `gwOrderDetail(id)`
+    // where the callee is `(id) => `/v1/orders/${id}``. Evaluate the function's returned string;
+    // its parameters are runtime values → fold to "{}" (matches a backend path param).
+    if (ts.isCallExpression(node)) return this.evalCall(node, depth);
+
     return NONE;
+  }
+
+  /** Evaluate a call to a project-local string-returning function (path-builder const). */
+  private evalCall(node: ts.CallExpression, depth: number): EvalString {
+    const ret = this.returnExprOf(node.expression);
+    if (!ret) return NONE;
+    return this.evalString(ret, depth + 1);
+  }
+
+  /** The single returned expression of the function backing a callee, or null. */
+  private returnExprOf(callee: ts.Expression): ts.Expression | null {
+    const fn = this.functionOfExpr(callee);
+    if (!fn) return null;
+    const body = fn.body;
+    if (!body) return null;
+    // arrow with an expression body: `(id) => `...``
+    if (!ts.isBlock(body)) return body as ts.Expression;
+    // block body: first `return <expr>;`
+    let found: ts.Expression | null = null;
+    const visit = (n: ts.Node) => {
+      if (found) return;
+      if (ts.isReturnStatement(n) && n.expression) {
+        found = n.expression;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(body, visit);
+    return found;
+  }
+
+  /** Resolve a callee expression to its arrow/function declaration (following consts/members). */
+  private functionOfExpr(callee: ts.Expression): ts.FunctionLikeDeclaration | null {
+    const sym = this.symbolAt(callee);
+    let init = this.initializerOfSymbol(sym);
+    if (init && ts.isIdentifier(init)) init = this.initializerOf(init) ?? init;
+    if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) return init;
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (decl && (ts.isFunctionDeclaration(decl) || ts.isMethodDeclaration(decl))) return decl;
+    return null;
   }
 
   /** For URL-building wrappers: try the expr, else descend into children (mirror resolveUrlBuildingCall). */
@@ -225,6 +270,12 @@ export class ConstantEvaluator {
   }
 
   private symbolAt(node: ts.Node): ts.Symbol | undefined {
+    // `{ url }` shorthand: getSymbolAtLocation yields the property symbol, not the local
+    // value it references. Resolve to the value symbol so `const url = ...; f({ url })` folds.
+    if (ts.isIdentifier(node) && node.parent && ts.isShorthandPropertyAssignment(node.parent)) {
+      const valSym = this.checker.getShorthandAssignmentValueSymbol(node.parent);
+      if (valSym) return valSym;
+    }
     let sym = this.checker.getSymbolAtLocation(node);
     if (sym && sym.flags & ts.SymbolFlags.Alias) {
       try {

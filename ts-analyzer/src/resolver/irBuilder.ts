@@ -79,6 +79,12 @@ export class TsResolver implements Resolver {
     const stores: StoreAccumulator = emptyAccumulator();
     for (const sf of pp.sourceFiles) collectStores(sf, ctx, stores);
 
+    // B2. redux thunks become walkable "action" nodes (dispatch → thunk → API edges).
+    for (const t of stores.thunks) {
+      const meta: CompMeta = { comp: t.comp, decl: t.bodyOwner, bodyOwner: t.bodyOwner, file: t.file };
+      metas.push(meta);
+    }
+
     // C. walk component bodies
     const walker = new BodyWalker(ctx, api, compBySymbol, stores);
     for (const m of metas) walker.walk(m);
