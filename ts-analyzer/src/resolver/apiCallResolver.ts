@@ -892,10 +892,11 @@ export class ApiCallResolver {
 
   /** The `axios.create(...)` call backing a declaration: a direct initializer
    *  (`const x = axios.create()` / `export default axios.create()`), a factory call
-   *  whose body returns one (`const homeAxios = createInstance()`), or an identifier
-   *  aliasing another instance (`export const homeAxios = baseInstance`). */
+   *  whose body returns one (`const homeAxios = createInstance()`), an identifier
+   *  aliasing another instance (`export const homeAxios = baseInstance`), or an
+   *  env-gated ternary/logical selection (`isServer ? serverAxios : secAxios`). */
   private axiosCreateInitOf(decl: ts.Node | undefined, depth = 0): ts.CallExpression | null {
-    if (!decl || depth > 4) return null;
+    if (!decl || depth > 6) return null;
     let expr: ts.Expression | undefined;
     if (ts.isVariableDeclaration(decl) || ts.isPropertyDeclaration(decl)) expr = decl.initializer;
     else if (ts.isExportAssignment(decl)) expr = decl.expression;
@@ -903,7 +904,19 @@ export class ApiCallResolver {
   }
 
   private axiosCreateFromExpr(expr: ts.Expression, depth: number): ts.CallExpression | null {
-    if (depth > 4) return null;
+    if (depth > 6) return null;
+    if (ts.isParenthesizedExpression(expr)) return this.axiosCreateFromExpr(expr.expression, depth + 1);
+    // Env-gated client selection: `isServer ? serverAxios : secAxios`, `a || b`, `a ?? b`
+    // — pick whichever branch resolves to an axios instance.
+    if (ts.isConditionalExpression(expr)) {
+      return this.axiosCreateFromExpr(expr.whenTrue, depth + 1) ?? this.axiosCreateFromExpr(expr.whenFalse, depth + 1);
+    }
+    if (
+      ts.isBinaryExpression(expr) &&
+      (expr.operatorToken.kind === ts.SyntaxKind.BarBarToken || expr.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    ) {
+      return this.axiosCreateFromExpr(expr.left, depth + 1) ?? this.axiosCreateFromExpr(expr.right, depth + 1);
+    }
     if (ts.isCallExpression(expr)) {
       if (this.isAxiosCreateCall(expr)) return expr;
       // Factory: `const homeAxios = createInstance()` — a project-local function that
@@ -912,7 +925,8 @@ export class ApiCallResolver {
       const body = fn && this.isProjectNode(fn) ? (fn as ts.FunctionLikeDeclaration).body : undefined;
       return body ? this.findAxiosCreate(body) : null;
     }
-    // Alias: `export const homeAxios = baseInstance` → follow to the backing decl.
+    // Alias: `export const homeAxios = baseInstance` (incl. a cross-module default import,
+    // whose own default export may be another ternary) → follow to the backing decl.
     if (ts.isIdentifier(expr)) {
       let sym = this.checker.getSymbolAtLocation(expr);
       if (sym && sym.flags & ts.SymbolFlags.Alias) {
