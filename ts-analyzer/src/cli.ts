@@ -61,7 +61,12 @@ function loadEnvFile(path?: string): Record<string, string> {
 
 /** Analyze ONE project root in-process (React and/or Vue) → IrFile[]. */
 function analyzeOneRoot(root: string, repoRoot: string, opts: Opts): IrFile[] {
-  const common = { repoRoot, projectFilter: null, env: loadEnvFile(opts.flags['--env']) };
+  const common = {
+    repoRoot,
+    projectFilter: null,
+    env: loadEnvFile(opts.flags['--env']),
+    envProfile: opts.flags['--env-profile'] || null,
+  };
   const files: IrFile[] = [];
   if (isReactProject(root)) files.push(...new TsResolver().analyzeRoot(root, repoRoot, common));
   if (isVueProject(root)) {
@@ -89,6 +94,7 @@ async function analyzeRepo(opts: Opts): Promise<{ graph: CallGraph; fileCount: n
       entry: process.argv[1],
       repoRoot,
       envFile: opts.flags['--env'] || undefined,
+      envProfile: opts.flags['--env-profile'] || undefined,
       mode: opts.flags['--mode'] || undefined,
     });
   } else {
@@ -246,6 +252,7 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   const backend = pick('--backend', 'BACKEND');
   const mode = pick('--mode', 'MODE');
   const envFile = pick('--env', 'ENV');
+  const envProfile = pick('--env-profile', 'ENV_PROFILE');
   const workers = pick('--workers', 'WORKERS');
   const noSplit = '--no-split' in opts.flags || /^(1|true|yes)$/i.test(cfg.NO_SPLIT ?? '');
   const pull = !(/^(0|false|no)$/i.test(pick('--pull', 'PULL', 'true')) || '--no-pull' in opts.flags);
@@ -262,6 +269,7 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   if (project) common['--project'] = project;
   if (mode) common['--mode'] = mode;
   if (envFile) common['--env'] = envFile;
+  if (envProfile) common['--env-profile'] = envProfile;
   if (workers) common['--workers'] = workers;
   if (noSplit) common['--no-split'] = '';
 
@@ -371,7 +379,7 @@ function usage(): void {
     [
       'flowmap-react (TypeScript Compiler API)',
       '  pipeline [--config flowmap.config]   # refresh repo → analyze → screens → join, options from config',
-      '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--mode development|production]',
+      '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--env-profile name] [--mode development|production]',
       '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
       '  join    --graph front.json --backend backend.json [--out join.json]',
       '  search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]',

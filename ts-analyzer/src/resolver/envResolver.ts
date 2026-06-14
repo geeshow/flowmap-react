@@ -59,6 +59,46 @@ export class EnvResolver {
     }
   }
 
+  /**
+   * Load an env-cmd `.env-cmdrc(.json)` config — a JSON of named profiles
+   * (`{ "sandbox": { "VITE_APP_API_GW": "..." }, "production": {...} }`), common
+   * in monorepos. Searches `rootDir` and its ancestors up to `stopDir` (repo root)
+   * and merges a `default`/`common` profile then the selected one (later wins).
+   * `profile` falls back to `mode`, then 'default'.
+   */
+  loadEnvCmdrc(rootDir: string, profile: string | null | undefined, mode = 'development', stopDir?: string): void {
+    const names = ['.env-cmdrc.json', '.env-cmdrc'];
+    const stop = stopDir ? path.resolve(stopDir) : path.parse(path.resolve(rootDir)).root;
+    let dir = path.resolve(rootDir);
+    for (;;) {
+      for (const name of names) {
+        const full = path.join(dir, name);
+        if (!fs.existsSync(full)) continue;
+        let doc: Record<string, unknown>;
+        try {
+          doc = JSON.parse(fs.readFileSync(full, 'utf8'));
+        } catch {
+          continue;
+        }
+        const wanted = [profile, mode].filter(Boolean) as string[];
+        const chosen = wanted.find((p) => doc[p] && typeof doc[p] === 'object') ?? 'default';
+        for (const key of ['default', 'common', chosen]) {
+          const prof = doc[key];
+          if (prof && typeof prof === 'object') {
+            for (const [k, v] of Object.entries(prof as Record<string, unknown>)) {
+              if (v != null && typeof v !== 'object') this.put(k, String(v));
+            }
+          }
+        }
+        return; // first config found (nearest) wins
+      }
+      if (dir === stop) break;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+
   /** Load a flat `key=value` props file (CLI --env), mirroring backend loadProps. */
   loadPropsFile(file: string): void {
     if (!fs.existsSync(file)) return;

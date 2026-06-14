@@ -59,8 +59,11 @@ export class TsResolver implements Resolver {
     const pp = buildProjectProgram(projectRoot, { repoRoot });
     const ctx = new AnalysisContext(pp.checker, repoRoot, pp.program.getCompilerOptions(), pp.sourceFiles);
 
-    const env = new EnvResolver(opts.env);
-    env.loadDotenv(projectRoot);
+    // Env precedence (lowest→highest): .env-cmdrc profile → .env files → CLI --env.
+    const env = new EnvResolver();
+    env.loadEnvCmdrc(projectRoot, opts.envProfile, opts.mode ?? 'development', repoRoot);
+    env.loadDotenv(projectRoot, opts.mode ?? 'development');
+    for (const [k, v] of Object.entries(opts.env ?? {})) env.put(k, v);
     const constEval = new ConstantEvaluator(pp.checker, env);
     const api = new ApiCallResolver(pp.checker, constEval, repoRoot, pp.sourceFiles);
 

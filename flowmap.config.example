@@ -25,8 +25,11 @@ MODE=development
 # PROJECT 미지정(전체 분석) 시 REPO(.repo) 루트가 git 저장소면 그곳을 pull 합니다.
 PULL=true
 
+# 모노레포 env-cmd(.env-cmdrc.json) 프로파일 선택 (예: sandbox) — API 게이트웨이 host 등 해석에 필요
+# ENV_PROFILE=sandbox
+
 # --- 선택: 대용량 저장소 메모리 튜닝 ---
-# ENV=path/to/app.env        # 앱 env 파일 (--env)
+# ENV=path/to/app.env        # 앱 env 파일 (--env): KEY=VALUE 직접 주입 (가장 확실한 host 주입 수단)
 # WORKERS=4                  # 동시 자식 프로세스 수
 # MAX_OLD_SPACE=12288        # 프로세스당 V8 힙(MB)
 # NO_SPLIT=false             # true 면 분할 끄고 단일 프로세스

@@ -32,7 +32,13 @@ beforeAll(() => {
   file('src/api/rtk.ts', `import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  baseQuery: fetchBaseQuery({ baseUrl: 'https://api.test.com' }),\n  endpoints: (b) => ({\n    getWidget: b.query({ query: (id: string) => \`/widgets/\${id}\` }),\n    addWidget: b.mutation({ query: (body: any) => ({ url: '/widgets', method: 'POST', body }) }),\n  }),\n});\nexport const { useGetWidgetQuery, useAddWidgetMutation } = api;\n`);
   // concise-arrow component body that IS a call/JSX
   file('src/pages/Home.tsx', `import { getOrder, delOrder } from '../api/orders';\nimport { useThing } from '../hooks/useThing';\nimport { useGetWidgetQuery, useAddWidgetMutation } from '../api/rtk';\nexport const Home = () => { useThing('1'); useGetWidgetQuery('1'); const [add] = useAddWidgetMutation(); return <button onClick={() => { getOrder('2'); delOrder('3'); add({}); }}>go</button>; };\n`);
-  const files = new TsResolver().analyzeRoot(dir, dir, { repoRoot: dir, projectFilter: null, env: {} });
+  // env-cmd `.env-cmdrc.json` + an `a || b` gateway-host const (the real monorepo shape):
+  // the host must resolve so the endpoint path (not `/{}/...`) joins to the backend.
+  file('.env-cmdrc.json', JSON.stringify({ sandbox: { VITE_APP_API_GW: 'https://sandbox-gw.example.com' } }));
+  file('src/env.ts', `export const API_GW = import.meta.env.VITE_APP_API_GW || process.env.NEXT_PUBLIC_API_GW;\n`);
+  file('src/api/gw.ts', `import axios from 'axios';\nimport { API_GW } from '../env';\nconst BASE = \`\${API_GW}/account/v1\`;\nexport const listAccounts = () => axios.get(\`\${BASE}/trading/accounts\`);\n`);
+  file('src/pages/Accounts.tsx', `import { listAccounts } from '../api/gw';\nexport const Accounts = () => <button onClick={() => listAccounts()}>a</button>;\n`);
+  const files = new TsResolver().analyzeRoot(dir, dir, { repoRoot: dir, projectFilter: null, env: {}, envProfile: 'sandbox' });
   graph = new GraphBuilder(files).build();
 });
 
@@ -59,6 +65,13 @@ describe('React HTTP-pattern coverage', () => {
   it('resolves RTK Query createApi endpoints via their generated hooks', () => {
     expect(endpoints()).toContain('GET /widgets/{}'); // useGetWidgetQuery (.query)
     expect(endpoints()).toContain('POST /widgets'); // useAddWidgetMutation (.mutation)
+  });
+
+  it('resolves an `a || b` gateway-host const via env-cmdrc so the path joins (no /{} host)', () => {
+    const eps = endpoints();
+    expect(eps).toContain('GET /account/v1/trading/accounts');
+    // the host must be stripped — never a leading {} placeholder segment
+    expect(eps.some((e) => e.includes('/{}/account'))).toBe(false);
   });
 
   it('walks a concise-arrow component body (calls inside it are captured)', () => {

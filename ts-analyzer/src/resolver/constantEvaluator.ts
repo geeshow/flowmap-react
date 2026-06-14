@@ -49,6 +49,20 @@ export class ConstantEvaluator {
       };
     }
 
+    // `a || b` / `a ?? b` — env fallback chains, e.g.
+    //   const API_GW = import.meta.env.VITE_APP_API_GW || process.env.NEXT_PUBLIC_API_GW || 'https://localhost'
+    // Take the left when it resolves (for `||`, also require non-empty), else the right.
+    if (
+      ts.isBinaryExpression(node) &&
+      (node.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+        node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    ) {
+      const nullish = node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken;
+      const l = this.evalString(node.left, depth + 1);
+      if (l.value != null && (nullish || l.value !== '')) return l;
+      return this.evalString(node.right, depth + 1);
+    }
+
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       return this.evalAccess(node, depth);
     }

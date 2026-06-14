@@ -83,6 +83,7 @@ export interface WorkerArgs {
   entry: string; // script to run (process.argv[1])
   repoRoot: string;
   envFile?: string;
+  envProfile?: string;
   mode?: string;
 }
 
@@ -98,6 +99,7 @@ function spawnOne(root: string, plan: WorkerPlan, a: WorkerArgs): Promise<IrFile
     const tmp = tmpFor(root);
     const args = [a.entry, '__ir', '--root', root, '--repo', a.repoRoot, '--out', tmp];
     if (a.envFile) args.push('--env', a.envFile);
+    if (a.envProfile) args.push('--env-profile', a.envProfile);
     if (a.mode) args.push('--mode', a.mode);
     const env = { ...process.env, [RESPAWN_FLAG]: '1', NODE_OPTIONS: withHeap(plan.perWorkerMB) };
     process.stderr.write(`  → ${path.basename(root)}\n`);

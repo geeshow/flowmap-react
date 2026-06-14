@@ -86,6 +86,7 @@ export interface ResolveOptions {
   repoRoot: string;
   projectFilter?: string | null;
   env?: Record<string, string>;
+  envProfile?: string | null; // env-cmd `.env-cmdrc` profile name (e.g. 'sandbox')
   mode?: string; // Vue/Nuxt config mode (development|production); ignored by React
 }
 
