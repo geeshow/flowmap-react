@@ -13,7 +13,7 @@
 
 import * as path from 'path';
 import * as ts from 'typescript';
-import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, isComponentName, isHookName } from '../classify';
+import { AXIOS_MODULES, AXIOS_REQUEST_METHODS, AXIOS_VERB_METHODS, SWR_QUERY_MODULES, isComponentName, isHookName } from '../classify';
 import type { ApiResolution } from '../ir';
 import type { Confidence } from '../model';
 import { normalize } from '../norm';
@@ -81,6 +81,22 @@ export class ApiCallResolver {
       return this.configForm(call, { name: 'axios', baseUrl: null, clientPackage: null });
     }
 
+    // useSWR(key, fetcher) — the key is the request URL (GET). Default-imported,
+    // so detect by module ('swr' / 'swr/immutable' / 'swr/infinite'), not name.
+    if (ts.isIdentifier(callee)) {
+      const mod = this.importModuleOf(this.checker.getSymbolAtLocation(callee));
+      if (mod && SWR_QUERY_MODULES.has(mod)) {
+        return {
+          method: 'GET',
+          verbConfident: true,
+          urlExpr: this.swrKeyExpr(call.arguments[0]),
+          service: 'swr',
+          instanceBaseUrl: null,
+          clientPackage: null,
+        };
+      }
+    }
+
     // recv.method(...)
     if (ts.isPropertyAccessExpression(callee)) {
       const method = callee.name.text;
@@ -133,6 +149,21 @@ export class ApiCallResolver {
       instanceBaseUrl: inst.baseUrl,
       clientPackage: inst.clientPackage,
     };
+  }
+
+  /** SWR key → URL expression: a string/template directly, an array's first
+   *  element (`[url, params]`), or a key thunk's body (`() => url`). */
+  private swrKeyExpr(key: ts.Expression | undefined): ts.Expression | undefined {
+    if (!key) return undefined;
+    if (ts.isArrayLiteralExpression(key)) return key.elements[0];
+    if ((ts.isArrowFunction(key) || ts.isFunctionExpression(key)) && key.body) {
+      if (ts.isBlock(key.body)) {
+        for (const st of key.body.statements) if (ts.isReturnStatement(st) && st.expression) return st.expression;
+        return undefined;
+      }
+      return key.body;
+    }
+    return key;
   }
 
   private methodFromConfig(cfg: ts.Expression | undefined): string | null {
@@ -226,7 +257,9 @@ export class ApiCallResolver {
       }
       ts.forEachChild(node, visit);
     };
-    ts.forEachChild(body, visit);
+    // Visit `body` ITSELF — a concise arrow body (`(id) => client.get(url)`) IS
+    // the call expression, so visiting only its children would miss it.
+    visit(body);
     return found;
   }
 
@@ -299,7 +332,9 @@ export class ApiCallResolver {
       }
       ts.forEachChild(node, visit);
     };
-    ts.forEachChild(body, visit);
+    // Visit `body` ITSELF — a concise arrow body (`(id) => client.get(url)`) IS
+    // the call expression, so visiting only its children would miss it.
+    visit(body);
     return found;
   }
 

@@ -250,9 +250,11 @@ class BodyWalker {
       ts.forEachChild(node, visit);
       if (entered) asyncDepth--;
     };
-    // walk the body only (skip the signature)
+    // walk the body only (skip the signature). Visit the body ITSELF so a concise
+    // arrow body (`const useThing = (id) => useSWR(url)`) — where the body IS the
+    // call/JSX expression — isn't skipped.
     const body = bodyOf(m.bodyOwner);
-    if (body) ts.forEachChild(body, visit);
+    if (body) visit(body);
   }
 
   private jsxUsage(node: ts.JsxOpeningElement | ts.JsxSelfClosingElement, sf: ts.SourceFile): IrJsxUsage | null {
