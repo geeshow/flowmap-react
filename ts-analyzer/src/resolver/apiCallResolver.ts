@@ -40,6 +40,8 @@ export interface RawHttp {
 export class ApiCallResolver {
   private readonly instanceCache = new Map<ts.Symbol, InstanceInfo | null>();
   private readonly projectFiles: Set<string>;
+  /** RTK Query generated-hook name → resolved endpoint (built once from createApi). */
+  private readonly rtkHooks: Map<string, ApiResolution>;
 
   constructor(
     private readonly checker: ts.TypeChecker,
@@ -48,10 +50,16 @@ export class ApiCallResolver {
     sourceFiles: ts.SourceFile[],
   ) {
     this.projectFiles = new Set(sourceFiles.map((sf) => path.resolve(sf.fileName)));
+    this.rtkHooks = this.buildRtkRegistry(sourceFiles);
   }
 
   /** Resolve a call to an ApiResolution, or null if it is not an HTTP call. */
   resolve(call: ts.CallExpression): ApiResolution | null {
+    // RTK Query generated hook: useGetWidgetQuery() → its endpoint.
+    if (this.rtkHooks.size && ts.isIdentifier(call.expression)) {
+      const hit = this.rtkHooks.get(call.expression.text);
+      if (hit) return hit;
+    }
     const raw = this.classifyHttpCall(call);
     if (raw) return this.buildFromRaw(raw, call, []);
     return this.traceWrapper(call, new Set());
@@ -399,6 +407,113 @@ export class ApiCallResolver {
     if (p && !p.startsWith('/')) p = '/' + p;
     const value = (b + p) || null;
     return { value, hasPlaceholder: base.hasPlaceholder || p.includes('${') };
+  }
+
+  // ---- RTK Query (createApi) ----
+
+  /** Scan every source file for `createApi({...})` and map each endpoint's
+   *  generated hook name (useXQuery / useLazyXQuery / useXMutation) to its
+   *  resolved endpoint, so a component calling that hook resolves to the API. */
+  private buildRtkRegistry(sourceFiles: ts.SourceFile[]): Map<string, ApiResolution> {
+    const out = new Map<string, ApiResolution>();
+    for (const sf of sourceFiles) {
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === 'createApi' &&
+          this.isReduxToolkitImport(node.expression)
+        ) {
+          this.parseCreateApi(node, out);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return out;
+  }
+
+  private parseCreateApi(call: ts.CallExpression, out: Map<string, ApiResolution>): void {
+    const cfg = call.arguments[0];
+    if (!cfg || !ts.isObjectLiteralExpression(cfg)) return;
+
+    // baseUrl from `baseQuery: fetchBaseQuery({ baseUrl })`
+    let baseUrl: EvalString | null = null;
+    const bq = this.propExpr(cfg, 'baseQuery');
+    if (bq && ts.isCallExpression(bq) && bq.arguments[0] && ts.isObjectLiteralExpression(bq.arguments[0])) {
+      const bu = this.propExpr(bq.arguments[0], 'baseUrl');
+      if (bu) baseUrl = this.constEval.evalString(bu);
+    }
+
+    // endpoints: (builder) => ({ name: builder.query/mutation({ query }) })
+    const epFn = this.propExpr(cfg, 'endpoints');
+    const epObj = epFn && this.fnReturnExpr(epFn);
+    if (!epObj || !ts.isObjectLiteralExpression(epObj)) return;
+
+    for (const p of epObj.properties) {
+      if (!ts.isPropertyAssignment(p)) continue;
+      const name = this.propName(p.name);
+      if (!name || !ts.isCallExpression(p.initializer)) continue;
+      const callee = p.initializer.expression;
+      if (!ts.isPropertyAccessExpression(callee)) continue;
+      const kind = callee.name.text; // query | mutation | infiniteQuery
+      if (kind !== 'query' && kind !== 'mutation' && kind !== 'infiniteQuery') continue;
+      const epCfg = p.initializer.arguments[0];
+      if (!epCfg || !ts.isObjectLiteralExpression(epCfg)) continue;
+      const queryFn = this.propExpr(epCfg, 'query');
+      if (!queryFn) continue; // custom queryFn (no static url) — skip
+      const ret = this.fnReturnExpr(queryFn);
+      if (!ret) continue;
+
+      let urlExpr: ts.Expression | undefined = ret;
+      // .query is a GET (definite); .mutation defaults to POST (an assumption
+      // unless the config states the method explicitly).
+      let method = kind === 'mutation' ? 'POST' : 'GET';
+      let verbConfident = kind !== 'mutation';
+      if (ts.isObjectLiteralExpression(ret)) {
+        // query: (a) => ({ url, method, body })
+        urlExpr = this.propExpr(ret, 'url');
+        const m = this.methodFromConfig(ret);
+        if (m) { method = m; verbConfident = true; }
+      }
+      const raw: RawHttp = {
+        method,
+        verbConfident,
+        urlExpr,
+        service: 'rtk-query',
+        instanceBaseUrl: baseUrl,
+        clientPackage: null,
+      };
+      const resolution = this.buildFromRaw(raw, call, ['createApi', name]);
+      const Pascal = name.charAt(0).toUpperCase() + name.slice(1);
+      if (kind === 'mutation') {
+        out.set(`use${Pascal}Mutation`, resolution);
+      } else {
+        out.set(`use${Pascal}Query`, resolution);
+        out.set(`useLazy${Pascal}Query`, resolution);
+      }
+    }
+  }
+
+  /** The expression a function returns: a concise arrow body, or the first
+   *  `return` in a block. Unwraps a parenthesized object literal. */
+  private fnReturnExpr(fn: ts.Expression): ts.Expression | undefined {
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return undefined;
+    let body: ts.Expression | undefined;
+    if (ts.isBlock(fn.body)) {
+      for (const st of fn.body.statements) {
+        if (ts.isReturnStatement(st) && st.expression) { body = st.expression; break; }
+      }
+    } else {
+      body = fn.body; // concise body expression
+    }
+    while (body && ts.isParenthesizedExpression(body)) body = body.expression;
+    return body;
+  }
+
+  private isReduxToolkitImport(node: ts.Identifier): boolean {
+    const mod = this.importModuleOf(this.checker.getSymbolAtLocation(node));
+    return mod != null && mod.startsWith('@reduxjs/toolkit');
   }
 
   // ---- symbol helpers ----

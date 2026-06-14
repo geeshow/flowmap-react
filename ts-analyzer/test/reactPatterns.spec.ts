@@ -28,8 +28,10 @@ beforeAll(() => {
   file('src/api/orders.ts', `import { client } from './client';\nexport const getOrder = (id: string) => client.get(\`/orders/\${id}\`);\nexport const delOrder = (id: string) => client({ method: 'delete', url: \`/orders/\${id}\` });\n`);
   // SWR read hook, written as a concise-arrow hook
   file('src/hooks/useThing.ts', `import useSWR from 'swr';\nimport { client } from '../api/client';\nconst fetcher = (u: string) => client.get(u).then(r => r.data);\nexport const useThing = (id: string) => useSWR(\`/things/\${id}\`, fetcher);\n`);
+  // RTK Query: createApi endpoints + generated hooks
+  file('src/api/rtk.ts', `import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  baseQuery: fetchBaseQuery({ baseUrl: 'https://api.test.com' }),\n  endpoints: (b) => ({\n    getWidget: b.query({ query: (id: string) => \`/widgets/\${id}\` }),\n    addWidget: b.mutation({ query: (body: any) => ({ url: '/widgets', method: 'POST', body }) }),\n  }),\n});\nexport const { useGetWidgetQuery, useAddWidgetMutation } = api;\n`);
   // concise-arrow component body that IS a call/JSX
-  file('src/pages/Home.tsx', `import { getOrder, delOrder } from '../api/orders';\nimport { useThing } from '../hooks/useThing';\nexport const Home = () => { useThing('1'); return <button onClick={() => { getOrder('2'); delOrder('3'); }}>go</button>; };\n`);
+  file('src/pages/Home.tsx', `import { getOrder, delOrder } from '../api/orders';\nimport { useThing } from '../hooks/useThing';\nimport { useGetWidgetQuery, useAddWidgetMutation } from '../api/rtk';\nexport const Home = () => { useThing('1'); useGetWidgetQuery('1'); const [add] = useAddWidgetMutation(); return <button onClick={() => { getOrder('2'); delOrder('3'); add({}); }}>go</button>; };\n`);
   const files = new TsResolver().analyzeRoot(dir, dir, { repoRoot: dir, projectFilter: null, env: {} });
   graph = new GraphBuilder(files).build();
 });
@@ -52,6 +54,11 @@ describe('React HTTP-pattern coverage', () => {
 
   it('resolves a useSWR(key, fetcher) read hook (key is the GET url)', () => {
     expect(endpoints()).toContain('GET /things/{}');
+  });
+
+  it('resolves RTK Query createApi endpoints via their generated hooks', () => {
+    expect(endpoints()).toContain('GET /widgets/{}'); // useGetWidgetQuery (.query)
+    expect(endpoints()).toContain('POST /widgets'); // useAddWidgetMutation (.mutation)
   });
 
   it('walks a concise-arrow component body (calls inside it are captured)', () => {
