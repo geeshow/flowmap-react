@@ -83,9 +83,17 @@ interface ServiceResult {
   fileCount: number;
 }
 
-/** Service id from a root dir: repo-relative path with separators → "-" (collision-safe). */
-function serviceName(repoRoot: string, root: string): string {
-  const rel = path.relative(repoRoot, root).split(path.sep).join('/');
+/**
+ * Service id from a root dir: repo-relative path with separators → "-"
+ * (collision-safe). A leading `<project>/` segment is dropped so per-root
+ * filenames don't repeat the project name (the `<name>` prefix already carries
+ * it): `<name>-<project>-<sub-root>.json` → `<name>-<sub-root>.json`.
+ */
+function serviceName(repoRoot: string, root: string, project?: string | null): string {
+  let rel = path.relative(repoRoot, root).split(path.sep).join('/');
+  if (project && (rel === project || rel.startsWith(`${project}/`))) {
+    rel = rel.slice(project.length).replace(/^\//, '');
+  }
   return (rel || path.basename(root)).replace(/\//g, '-');
 }
 
@@ -122,7 +130,7 @@ async function analyzeRepoSplit(opts: Opts): Promise<{ combined: CallGraph; file
   }
 
   const services: ServiceResult[] = roots.map((root, i) => ({
-    name: serviceName(repoRoot, root),
+    name: serviceName(repoRoot, root, opts.flags['--project'] ?? null),
     root: repoRel(repoRoot, root),
     graph: new GraphBuilder(perRoot[i]).build(),
     fileCount: perRoot[i].length,
@@ -467,7 +475,7 @@ function cmdScreens(opts: Opts): void {
     const stem = path.basename(out).replace(/\.screens\.json$/, '').replace(/\.json$/, '');
     for (const root of roots) {
       const doc = buildScreens({ repoRoot: repo, roots: [root] });
-      const outPath = path.join(dir, `${stem}-${serviceName(repoRoot, root)}.screens.json`);
+      const outPath = path.join(dir, `${stem}-${serviceName(repoRoot, root, project)}.screens.json`);
       fs.writeFileSync(outPath, jsonOutput.writeValue(doc));
       process.stderr.write(`wrote ${outPath}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
     }
