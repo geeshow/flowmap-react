@@ -37,6 +37,13 @@ export class ConstantEvaluator {
 
     if (ts.isParenthesizedExpression(node)) return this.evalString(node.expression, depth + 1);
 
+    // `<expr> as const` / `<Type>expr` — type assertions are transparent to the value.
+    // (Needed for `const BASE = `${API_GW}/account` as const` when the env host is
+    // unresolved, so the checker can't fold it to a literal type.)
+    if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node)) {
+      return this.evalString(node.expression, depth + 1);
+    }
+
     if (ts.isTemplateExpression(node)) return this.evalTemplate(node, depth);
 
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {

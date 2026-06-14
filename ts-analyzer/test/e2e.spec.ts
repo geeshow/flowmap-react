@@ -70,12 +70,23 @@ describe('e2e on sample-shop-react', () => {
     // `axios.create(...)`: it's `isServer ? serverAxios : secAxios`, and secAxios's own
     // module default-export is itself `isMock ? mockAxios : secAxios` over an
     // `axios.create({...})` — so instance detection must follow ternaries + cross-file aliases.
-    const list = httpNodes.find((n) => n.endpoint === '/account/v1/account-list');
+    const list = byId('ext:GET api.shop.com/account/v1/account-list');
     expect(list).toBeTruthy();
     const hook = byId('sample-shop-react/src/api/homeQuery.ts::useHomeAccountListSuspenseQuery');
     expect(hook).toBeTruthy();
     const edge = g.edges.find((e) => e.source === hook!.id && e.relation === 'http' && e.target === list!.id);
     expect(edge).toBeTruthy();
+  });
+
+  it('strips an unresolved env gateway host, keeping the path (`${API_GW}/account/...` → /account/...)', () => {
+    // GatewayHostPage → fetch(`${API_GW}/account/v1/account-list`) where API_GW is an env
+    // host that can't resolve. The host varies per environment so it is excluded, but the
+    // path after it must survive as the join key — NOT collapse to `/{}/v1/account-list`.
+    const node = byId('ext:GET /account/v1/account-list');
+    expect(node).toBeTruthy();
+    expect(node!.endpoint).toBe('/account/v1/account-list');
+    expect(node!.layer).toBe('API'); // host unresolved → not EXTERNAL
+    expect(node!.urlPlaceholder).toContain('${UNRESOLVABLE_GW_HOST}');
   });
 
   it('resolves a URL pulled from a local object destructure (const { url } = config)', () => {

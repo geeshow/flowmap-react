@@ -680,6 +680,16 @@ export class ApiCallResolver {
       const slash = afterHost.indexOf('/');
       return slash >= 0 ? afterHost.slice(slash) : '/';
     }
+    // Env-placeholder host (`${API_GW}/account/v1/...`): the gateway host varies by
+    // environment and can't resolve, so it stands in for scheme+host. Strip the leading
+    // `${...}` so the path after it is the join key (`/account/v1/...`), not `/{}/...`.
+    if (url.startsWith('${')) {
+      const end = url.indexOf('}');
+      if (end >= 0) {
+        const rest = url.slice(end + 1);
+        return rest === '' ? '/' : rest.startsWith('/') ? rest : '/' + rest;
+      }
+    }
     return url.startsWith('/') ? url : '/' + url;
   }
 
