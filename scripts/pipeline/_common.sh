@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared setup for the staged pipeline scripts. Sourced by 0..3.*.sh.
+# Shared setup for the staged pipeline scripts. Sourced by 01..05-*.sh.
 # Mirrors ts-analyzer/src/cli.ts cmdPipeline: same config, names, and sub-commands.
 set -euo pipefail
 

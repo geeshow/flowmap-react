@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage 4: per-root PR change-impact against each front graph → <graph>.impact.json
-# (+ <graph>.impact/<n>.json shards). Mirrors flowmap-spring scripts/5-impact.sh.
+# (+ <graph>.impact/<n>.json shards). Mirrors flowmap-spring scripts/05-impact.sh.
 #
 # For each service graph `<OUT_DIR>/<root>/<BASE>.json`, the matching checkout is REPO/<root>;
 # a root that is its own standalone git repo is mined for merged PRs (git-first, gh
