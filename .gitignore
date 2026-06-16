@@ -8,13 +8,14 @@ dist/
 # demo fixtures. The whole checkout area is ignored.
 /.repo/
 
-# Analysis outputs (graphs / join / screens JSON)
+# Analysis outputs (graphs / join / screens / impact JSON). Now per-service:
+# <OUT_DIR>/<service>/graph.*.json (+ graph.impact/ shards) — ignore the whole
+# service tree, keep tracked docs like json/README.md.
 /json/*.json
+/json/*/
 
-# Local pipeline config (machine-specific paths). The example stays tracked.
+# --- 머신별 실행 설정(real). 템플릿 flowmap.config.example 만 추적 ---
 /flowmap.config
-/flowmap.env
-/.flowmaprc
 
 # OS / editor
 .DS_Store
