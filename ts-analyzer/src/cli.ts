@@ -14,7 +14,7 @@ import { bfs, Direction, findNodes } from './bfs';
 import { GraphBuilder } from './graphBuilder';
 import { join as joinGraphs } from './join';
 import * as jsonOutput from './jsonOutput';
-import { CallGraph } from './model';
+import { CallGraph, CallEdge, MethodNode } from './model';
 import { checkGraph, formatHealth } from './doctor';
 import type { IrFile } from './ir';
 import { TsResolver } from './resolver/irBuilder';
@@ -23,6 +23,8 @@ import { discoverProjectRoots } from './resolver/projectScan';
 import { VueResolver } from './resolver/vue/vueIrBuilder';
 import { buildScreens } from './screens';
 import { ensureHeap, planWorkers, runProjectWorkersByRoot } from './workers';
+import * as impact from './impact/impact';
+import * as gitSource from './impact/git';
 
 interface Opts {
   flags: Record<string, string>;
@@ -180,26 +182,23 @@ function dump(graph: CallGraph, out: string | undefined, meta: Record<string, un
 
 /**
  * Graph files to join against the backend, derived from disk so it works even
- * when analyze didn't run this invocation (e.g. `pipeline --only join`). For a
- * split repo these are the per-root `<base>-<root>.json` files; for a single
- * graph it's `<base>.json`. Derived artifacts (.join/.screens/.openapi/.impact)
- * are excluded. Returns absolute-ish paths (joined with `dir`).
+ * when analyze didn't run this invocation (e.g. `pipeline --only join`). Each
+ * service is a subdirectory holding its `<base>.json` graph (derived
+ * .join/.screens/.openapi/.impact siblings live alongside but are not graphs).
+ * Returns one `<dir>/<service>/<base>.json` path per service.
  */
 function listGraphsToJoin(dir: string, base: string): string[] {
-  const derived = /\.(join|screens|openapi|impact)\.json$/;
-  let names: string[];
+  let entries: fs.Dirent[];
   try {
-    names = fs.readdirSync(dir);
+    entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
     return [];
   }
-  const perRoot = names
-    .filter((f) => f.startsWith(`${base}-`) && f.endsWith('.json') && !derived.test(f))
-    .sort()
-    .map((f) => path.join(dir, f));
-  if (perRoot.length) return perRoot;
-  const single = path.join(dir, `${base}.json`);
-  return fs.existsSync(single) ? [single] : [];
+  return entries
+    .filter((e) => e.isDirectory())
+    .map((e) => path.join(dir, e.name, `${base}.json`))
+    .filter((g) => fs.existsSync(g))
+    .sort();
 }
 
 /** Rescan the output directory of `out` and (re)write `_manifest.json`. */
@@ -218,18 +217,19 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
   const { combined, fileCount, repo, services } = await analyzeRepoSplit(opts);
   const out = opts.flags['--out'];
 
-  // Multiple project roots → split, ONE self-contained graph per root as
-  // `<name>-<service>.json`. We deliberately do NOT emit a merged whole-repo
-  // graph: merging large independent services back into one defeats the point
-  // of splitting them (and collapses same-id nodes across services). Every
-  // analyzed node belongs to exactly one root, so there is no "leftover" graph
-  // to write at `<name>.json` either. The _manifest.json rescans the dir and
-  // catalogues each per-root graph individually.
-  if (out && services.length > 1) {
+  // Each project root → its OWN self-contained graph under a per-service
+  // directory: `<dir>/<service>/<name>.json`. We deliberately do NOT emit a
+  // merged whole-repo graph: merging large independent services back into one
+  // defeats the point of splitting them (and collapses same-id nodes across
+  // services). Every analyzed node belongs to exactly one root. The
+  // _manifest.json rescans the dir and catalogues each service graph.
+  if (out && services.length >= 1) {
     const dir = path.dirname(out) || '.';
     const base = path.basename(out, '.json');
     for (const s of services) {
-      dump(s.graph, path.join(dir, `${base}-${s.name}.json`), {
+      const svcDir = path.join(dir, s.name);
+      fs.mkdirSync(svcDir, { recursive: true });
+      dump(s.graph, path.join(svcDir, `${base}.json`), {
         command: 'analyze',
         repo,
         project: s.name,
@@ -243,8 +243,7 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
     return;
   }
 
-  // Single root (or whole-repo single program, or stdout): `<name>.json` holds
-  // the one graph.
+  // No project roots discovered, or stdout (no --out): emit the combined graph.
   dump(combined, out, {
     command: 'analyze',
     repo,
@@ -257,27 +256,58 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
   refreshManifest(out);
 }
 
+/** Split a `--backend`/BACKEND value into one or more graph paths (CSV). */
+function backendPaths(arg: string): string[] {
+  return arg.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/**
+ * Merge several backend graphs into one (nodes deduped by id, edges by
+ * source/target/relation). The join only reads backend nodes, but edges are kept
+ * coherent. Used to join a frontend against MULTIPLE backends (e.g. Spring +
+ * nexcore) in a single pass so their providers/aliases share one index.
+ */
+function mergeGraphs(graphs: CallGraph[]): CallGraph {
+  if (graphs.length === 1) return graphs[0];
+  const nodes = new Map<string, MethodNode>();
+  const edges: CallEdge[] = [];
+  const seenEdge = new Set<string>();
+  for (const g of graphs) {
+    for (const n of g.nodes) if (!nodes.has(n.id)) nodes.set(n.id, n);
+    for (const e of g.edges) {
+      const k = `${e.source} ${e.target} ${e.relation}`;
+      if (!seenEdge.has(k)) { seenEdge.add(k); edges.push(e); }
+    }
+  }
+  return { nodes: [...nodes.values()], edges };
+}
+
 function cmdJoin(opts: Opts): void {
   const graphPath = opts.flags['--graph'];
-  const backendPath = opts.flags['--backend'];
-  if (!graphPath || !backendPath) {
-    process.stderr.write('join: --graph front.json --backend backend.json required\n');
+  const backendArg = opts.flags['--backend'];
+  if (!graphPath || !backendArg) {
+    process.stderr.write('join: --graph front.json --backend backend.json[,backend2.json] required\n');
     process.exit(2);
   }
-  for (const [label, p] of [['--graph', graphPath], ['--backend', backendPath]] as const) {
+  if (!fs.existsSync(graphPath)) {
+    process.stderr.write(`join: --graph file not found: ${graphPath}\n`);
+    process.exit(1);
+  }
+  const backends = backendPaths(backendArg);
+  for (const p of backends) {
     if (!fs.existsSync(p)) {
-      process.stderr.write(`join: ${label} file not found: ${p}\n`);
+      process.stderr.write(`join: --backend file not found: ${p}\n`);
       process.exit(1);
     }
   }
   const frontend = jsonOutput.read(fs.readFileSync(graphPath, 'utf8'));
-  const backend = jsonOutput.read(fs.readFileSync(backendPath, 'utf8'));
+  const backend = mergeGraphs(backends.map((p) => jsonOutput.read(fs.readFileSync(p, 'utf8'))));
   const result = joinGraphs(frontend, backend);
   const doc = {
     meta: {
       command: 'join',
       frontendGraph: graphPath,
-      backendGraph: backendPath,
+      backendGraph: backends.length === 1 ? backends[0] : backends,
       ...result.meta,
     },
     links: result.links,
@@ -288,7 +318,10 @@ function cmdJoin(opts: Opts): void {
     process.stderr.write(
       `wrote ${opts.flags['--out']}: ${result.meta.matched} matched (${result.meta.viaGateway} via gateway), ${result.meta.unmatched} unmatched, ${result.meta.ambiguous} ambiguous\n`,
     );
-    refreshManifest(opts.flags['--out']);
+    // The join output is a sibling of the graph inside the service dir; the
+    // catalogue sits one level up at OUT_DIR. refreshManifest takes dirname, so
+    // hand it the service dir → it rescans OUT_DIR.
+    refreshManifest(path.dirname(opts.flags['--out']));
   } else {
     process.stdout.write(text + '\n');
   }
@@ -410,8 +443,9 @@ async function cmdPipeline(opts: Opts): Promise<void> {
     process.stderr.write(`\n[3/3] join skipped (--only ${[...steps].join(',')})\n`);
   } else if (!backend) {
     process.stderr.write(`\n[3/3] join skipped — set BACKEND in config (or --backend) to enable\n`);
-  } else if (!fs.existsSync(backend)) {
-    process.stderr.write(`\n[3/3] join skipped — backend graph not found: ${backend}\n`);
+  } else if (backendPaths(backend).some((p) => !fs.existsSync(p))) {
+    const missing = backendPaths(backend).filter((p) => !fs.existsSync(p));
+    process.stderr.write(`\n[3/3] join skipped — backend graph not found: ${missing.join(', ')}\n`);
   } else {
     const graphs = listGraphsToJoin(outDir, base);
     if (!graphs.length) {
@@ -465,17 +499,19 @@ function cmdScreens(opts: Opts): void {
   const out = opts.flags['--out'];
   const project = opts.flags['--project'] ?? null;
 
-  // Mirror analyze: a split repo gets ONE screens doc per root, named to pair
-  // with that root's graph (`<name>-<root>.screens.json`), so the manifest links
-  // each per-root graph to its own screens. Single root → the plain `<out>`.
+  // Mirror analyze: ONE screens doc per root, written next to that root's graph
+  // under the per-service directory (`<dir>/<service>/<name>.screens.json`), so
+  // the manifest links each service graph to its own screens.
   const roots = discoverProjectRoots(repo, project);
-  if (out && roots.length > 1) {
+  if (out && roots.length >= 1) {
     const repoRoot = path.resolve(repo);
     const dir = path.dirname(out) || '.';
     const stem = path.basename(out).replace(/\.screens\.json$/, '').replace(/\.json$/, '');
     for (const root of roots) {
+      const svcDir = path.join(dir, serviceName(repoRoot, root, project));
+      fs.mkdirSync(svcDir, { recursive: true });
       const doc = buildScreens({ repoRoot: repo, roots: [root] });
-      const outPath = path.join(dir, `${stem}-${serviceName(repoRoot, root, project)}.screens.json`);
+      const outPath = path.join(svcDir, `${stem}.screens.json`);
       fs.writeFileSync(outPath, jsonOutput.writeValue(doc));
       process.stderr.write(`wrote ${outPath}: ${doc.meta.screens} screens, ${doc.meta.components} components\n`);
     }
@@ -516,6 +552,68 @@ async function cmdStats(opts: Opts): Promise<void> {
   process.stdout.write(`api/external nodes: ${apiNodes.length}   confidence: ${JSON.stringify(conf)}\n`);
 }
 
+/**
+ * Per-PR change-impact against a frontend graph (port of the Spring `impact`
+ * command). Mines merged PRs from the `--git` repo (git-first, gh fallback),
+ * attributes each PR's changed lines to graph node ids, and reports the SCREEN
+ * nodes they reach. Writes a lean `<out>` index + heavy `<base>.impact/<n>.json`
+ * shards (pruning shards for PRs no longer in the window).
+ */
+function cmdImpact(opts: Opts): void {
+  const repo = path.resolve(opts.flags['--git'] ?? opts.flags['--repo'] ?? '.');
+  if (!gitSource.isRepo(repo)) {
+    process.stderr.write(`impact: ${repo} is not a git work tree (pass --git <repo>)\n`);
+    process.exit(2);
+  }
+  const graphPath = opts.flags['--graph'];
+  if (!graphPath) {
+    process.stderr.write('impact: --graph <graph.json> required\n');
+    process.exit(2);
+  }
+  const graph = readGraphFile(graphPath);
+  const base = gitSource.resolveBranch(repo, opts.flags['--base'] ?? null);
+  if (!base) {
+    process.stderr.write(`impact: cannot resolve a branch to mine in ${repo} (pass --base)\n`);
+    process.exit(1);
+  }
+  // Project-dir prefix prepended to git paths so blob ids match graph node ids.
+  const prefix = opts.flags['--prefix'] ?? path.basename(repo);
+  const max = parseInt(opts.flags['--max'] ?? '10', 10) || 10;
+
+  const pulls = gitSource.mergedPulls(repo, base, max);
+  if (pulls == null) {
+    process.stderr.write(`impact: no PR source for base ${base} (no git PR markers + gh unavailable)\n`);
+    process.exit(1);
+  }
+  const result = impact.analyze(repo, base, prefix, pulls, graph);
+  const out = opts.flags['--out'];
+  if (!out) {
+    process.stdout.write(jsonOutput.writeValue(result.index) + '\n');
+    return;
+  }
+  fs.writeFileSync(out, jsonOutput.writeValue(result.index));
+  // heavy per-PR shards under `<base>.impact/`, pruning stale ones
+  const shardDir = impact.shardDirOf(out);
+  fs.mkdirSync(shardDir, { recursive: true });
+  const keep = new Set<string>();
+  for (const [number, shard] of result.shards) {
+    fs.writeFileSync(path.join(shardDir, `${number}.json`), jsonOutput.writeValue(shard));
+    keep.add(`${number}.json`);
+  }
+  try {
+    for (const f of fs.readdirSync(shardDir)) if (f.endsWith('.json') && !keep.has(f)) fs.unlinkSync(path.join(shardDir, f));
+    if (fs.readdirSync(shardDir).length === 0) fs.rmdirSync(shardDir);
+  } catch {
+    /* shard-dir prune is best-effort */
+  }
+  process.stderr.write(
+    `wrote ${out}: ${pulls.length} PRs, ${result.index.changedNodeCount} changed nodes, ${result.index.impactedEndpointCount} impacted screens\n`,
+  );
+  // Impact output is a sibling of the graph inside the service dir; the catalogue
+  // sits one level up at OUT_DIR (refreshManifest takes dirname of its arg).
+  refreshManifest(path.dirname(out));
+}
+
 function countBy<T>(items: T[], key: (t: T) => string): Record<string, number> {
   const out: Record<string, number> = {};
   for (const it of items) {
@@ -538,6 +636,8 @@ function usage(): void {
       '  stats   [--graph g.json | --repo <dir>]',
       '  doctor  [--graph g.json | --repo <dir>] [--max-orphans N]   # graph health: orphans, dangling, connectivity',
       '  screens --repo <dir> [--project P] [--out f.json]   # screen layout/wireframe data',
+      '  impact  --git <repo> --graph g.json [--out f.impact.json] [--base branch] [--max N] [--prefix P]',
+      '          # per-PR change impact: changed nodes + the screens they reach (git-first, gh fallback)',
       '',
     ].join('\n'),
   );
@@ -588,6 +688,9 @@ async function main(): Promise<void> {
       break;
     case 'screens':
       cmdScreens(opts);
+      break;
+    case 'impact':
+      cmdImpact(opts);
       break;
     case '-h':
     case '--help':

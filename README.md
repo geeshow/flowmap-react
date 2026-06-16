@@ -2,7 +2,7 @@
 
 **React** 와 **Vue 2 / Nuxt 2**(Pug + Vuex) 프론트엔드를 **정적 분석**해서 화면(screen)·컴포넌트·
 외부 API 호출·상태관리 스토어의 연결관계를 그래프 JSON으로 뽑아내고, 백엔드 분석기
-[`flowmap-spring-kotlin`](../flowmap-spring-kotlin)의 결과와 **조인**해 프론트엔드→백엔드 전체
+[`flowmap-spring`](../flowmap-spring)의 결과와 **조인**해 프론트엔드→백엔드 전체
 영향도를 복원하는 도구입니다. 추가로 화면을 와이어프레임으로 그려내기 위한 **레이아웃 데이터**도
 생성합니다. (프레임워크는 프로젝트별로 자동 감지 — 한 번의 `analyze`로 React/Vue 프로젝트를 함께 처리)
 
@@ -53,7 +53,7 @@ node dist/cli.js analyze --repo ../.repo --project sample-shop-nuxt  --out ../js
 
 # 2) 조인: 백엔드 그래프와 연결 (별도 조인 파일, 그래프는 병합하지 않음)
 node dist/cli.js join --graph ../json/front.json \
-  --backend ../../flowmap-spring-kotlin/kotlin-analyzer/json/_combined.json \
+  --backend ../../flowmap-spring/kotlin-analyzer/json/_combined.json \
   --out ../json/join.json
 
 # 3) 화면 와이어프레임 데이터
@@ -90,8 +90,10 @@ cp flowmap.config.example flowmap.config   # 값을 환경에 맞게 수정
 # 또는: npm run pipeline / ./flowmap pipeline --config 다른경로.config
 ```
 
-설정파일(`flowmap.config`)은 `KEY=VALUE` 형식이며 `${VAR}` 치환을 지원합니다. 출력 파일명은
-`PROJECT` 기준으로 자동 파생됩니다 — `<OUT_DIR>/<PROJECT>.json`, `.screens.json`, `.join.json`.
+설정파일(`flowmap.config`)은 `KEY=VALUE` 형식이며 `${VAR}` 치환을 지원합니다. 출력은
+**서비스(프로젝트 루트)별 디렉터리**로 나뉩니다 — `<OUT_DIR>/<service>/<NAME>.json`,
+`.screens.json`, `.join.json`, `.impact.json` (+ `<NAME>.impact/<n>.json` 샤드). 전체 카탈로그
+`_manifest.json` 은 `<OUT_DIR>` 최상위 1개로, 각 항목 경로를 `<service>/<file>` 로 가리킵니다.
 
 | 키 | 설명 |
 |---|---|

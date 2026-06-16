@@ -98,4 +98,45 @@ describe('join', () => {
     expect(r.meta.unmatched).toBe(1);
     expect(r.links[0].via).toBeNull();
   });
+
+  // ---- alias / segment probe: opaque-token endpoints (e.g. nexcore .jmd) ----
+
+  function aliasBackend(): CallGraph {
+    return {
+      nodes: [
+        // a nexcore `.jmd` transaction: path is /TACU0001.jmd, addressable as token TACU0001
+        makeNode({ id: 'PACU0001#pACU0001', fqcn: 'PACU0001', method: 'pACU0001', layer: 'CONTROLLER', httpMethod: 'POST', endpoint: '/TACU0001.jmd', aliases: ['TACU0001'], project: 'acc-app-ac' }),
+      ],
+      edges: [],
+    };
+  }
+
+  it.each([
+    ['/std/TACU0001', 'with /std/ context prefix'],
+    ['/lng/TACU0001', 'with /lng/ context prefix'],
+    ['/TACU0001', 'bare token'],
+    ['/std/TACU0001.jmd', 'prefix + .jmd extension'],
+  ])('matches FE call %s to the nexcore transaction alias (%s)', (endpoint) => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'POST', endpoint })], edges: [] };
+    const r = join(front, aliasBackend());
+    expect(r.meta.matched).toBe(1);
+    expect(r.meta.viaAlias).toBe(1);
+    expect(r.links[0].via).toBe('alias');
+    expect(r.links[0].backendNodeId).toBe('PACU0001#pACU0001');
+    expect(r.links[0].backendProject).toBe('acc-app-ac');
+  });
+
+  it('does not alias-match an ordinary path with no token segment', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'GET', endpoint: '/std/customers/{}' })], edges: [] };
+    const r = join(front, aliasBackend());
+    expect(r.meta.unmatched).toBe(1);
+    expect(r.links[0].via).toBeNull();
+  });
+
+  it('respects verb compatibility on alias matches', () => {
+    // .jmd transactions are POST; a GET to the same token must not match
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'GET', endpoint: '/std/TACU0001' })], edges: [] };
+    const r = join(front, aliasBackend());
+    expect(r.meta.unmatched).toBe(1);
+  });
 });
