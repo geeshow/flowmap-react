@@ -13,7 +13,7 @@ import { CallGraph } from '../src/model';
 import { VueResolver } from '../src/resolver/vue/vueIrBuilder';
 
 const REPO = path.resolve(__dirname, '../../.repo');
-const BACKEND = path.resolve(__dirname, '../../../flowmap-spring-kotlin/kotlin-analyzer/json/_combined.json');
+const BACKEND = path.resolve(__dirname, '../../../flowmap-spring/kotlin-analyzer/json/_combined.json');
 
 function analyze(): CallGraph {
   const files = new VueResolver().analyze({ repoRoot: REPO, projectFilter: 'sample-shop-nuxt', mode: 'development' });

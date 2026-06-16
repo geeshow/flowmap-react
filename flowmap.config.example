@@ -10,13 +10,17 @@ REPO=.repo
 #   PROJECT=fe-service-workspace
 
 # 출력 파일명 베이스 (없으면 PROJECT, 그것도 없으면 graph):
-#   <OUT_DIR>/<NAME>.json , .screens.json , .join.json
+# 서비스(프로젝트 루트)별로 디렉터리가 나뉘어 산출됩니다:
+#   <OUT_DIR>/<service>/<NAME>.json , .screens.json , .join.json , .impact.json
 NAME=graph
 
-# 결과 JSON을 모아둘 디렉터리 (없으면 자동 생성)
-OUT_DIR=../docs/web/data
+# 결과 JSON을 모아둘 디렉터리 (없으면 자동 생성). 서비스별 하위 디렉터리가 이 아래에 생성됨.
+OUT_DIR=json/frontend
 # 백엔드 결합 그래프 (join 단계 입력). 없거나 파일이 없으면 join 은 건너뜁니다.
-BACKEND=${OUT_DIR}/_combined.json
+# CSV 로 여러 백엔드 지정 가능 — join 이 모든 백엔드의 컨트롤러/alias 를 한 인덱스로 합쳐 매칭.
+#   예: BACKEND=../flowmap-spring/json/_combined.json,../flowmap-nexcore/json/_combined.json
+#   (nexcore .jmd 트랜잭션은 /std·/lng 등 프리픽스 호출을 alias[Tid] 로 매칭)
+BACKEND=../flowmap-spring/json/_combined.json
 
 # Vue/Nuxt env 선택 (development|production). React 는 무시.
 MODE=development

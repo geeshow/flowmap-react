@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # Stage 3: join each front graph against BACKEND → <graph>.join.json.
 # Reuses the analyze output, so run stage 1 first. Skipped if BACKEND is unset/missing.
+# BACKEND may be a CSV of graphs (e.g. spring `_combined.json,../flowmap-nexcore/json/_combined.json`):
+# the join unions every backend's controllers + aliases into one match index.
 . "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 if [ -z "$BACKEND" ]; then
   echo "[3] join skipped — set BACKEND in $CONFIG to enable" >&2
   exit 0
 fi
-if [ ! -f "$BACKEND" ]; then
-  echo "[3] join skipped — backend graph not found: $BACKEND" >&2
-  exit 0
-fi
+# Validate each CSV entry; skip the whole stage if any backend graph is missing.
+IFS=',' read -ra _BACKENDS <<< "$BACKEND"
+for _b in "${_BACKENDS[@]}"; do
+  _b="${_b#"${_b%%[![:space:]]*}"}"; _b="${_b%"${_b##*[![:space:]]}"}"  # trim
+  if [ -n "$_b" ] && [ ! -f "$_b" ]; then
+    echo "[3] join skipped — backend graph not found: $_b" >&2
+    exit 0
+  fi
+done
 
 GRAPHS=()
 while IFS= read -r line; do

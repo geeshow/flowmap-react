@@ -35,53 +35,66 @@ const MANIFEST_SUFFIXES = ['.join.json', '.screens.json', '.openapi.json', '.imp
 /**
  * Scan `outDir` and (re)write `_manifest.json` — a lightweight catalogue of the
  * frontend graphs present, shared verbatim with the backend analyzer's manifest
- * contract (version 1). One entry per pure `<project>.json`; sibling join/screens
- * files are linked when they actually exist on disk.
+ * contract (version 1). Each service lives in its own subdirectory holding a pure
+ * `<base>.json` graph; sibling join/screens/impact files (and graph/join/etc.
+ * paths) are recorded relative to `outDir` as `<service>/<file>`.
  */
 export function writeManifest(outDir: string): string {
-  const entries = fs
-    .readdirSync(outDir)
-    .filter((f) => f.endsWith('.json') && !f.startsWith('_'))
-    .filter((f) => !MANIFEST_SUFFIXES.some((s) => f.endsWith(s)))
+  const services = fs
+    .readdirSync(outDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
     .sort();
 
   // Frontend-only node layers — their presence marks a graph as a frontend graph.
   const FRONTEND_LAYERS = new Set(['SCREEN', 'HOOK', 'STORE', 'API']);
 
-  const projects = entries.map((graphFile) => {
-    const base = graphFile.slice(0, -'.json'.length);
-    const sibling = (suffix: string) => (fs.existsSync(path.join(outDir, `${base}.${suffix}`)) ? `${base}.${suffix}` : null);
+  const projects = services
+    .map((service) => {
+      const svcDir = path.join(outDir, service);
+      // The one pure graph in a service dir: a `.json` that is neither a derived
+      // sibling (.join/.screens/.openapi/.impact) nor an internal `_` file.
+      const graphFile = fs
+        .readdirSync(svcDir)
+        .filter((f) => f.endsWith('.json') && !f.startsWith('_'))
+        .find((f) => !MANIFEST_SUFFIXES.some((s) => f.endsWith(s)));
+      if (!graphFile) return null;
 
-    let nodes = 0;
-    let edges = 0;
-    let isFrontend = false;
-    let generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    try {
-      const root = JSON.parse(fs.readFileSync(path.join(outDir, graphFile), 'utf8'));
-      nodes = int(root.meta, 'nodes') ?? (Array.isArray(root.nodes) ? root.nodes.length : 0);
-      edges = int(root.meta, 'edges') ?? (Array.isArray(root.edges) ? root.edges.length : 0);
-      // Detect type from node layers so a shared dir holding BOTH backend and
-      // frontend graphs is catalogued correctly no matter which tool wrote last.
-      isFrontend = Array.isArray(root.nodes) && root.nodes.some((n: { layer?: string }) => n.layer != null && FRONTEND_LAYERS.has(n.layer));
-      const g = str(root.meta, 'generated');
-      if (g) generated = g;
-    } catch {
-      // Unreadable/non-graph json — keep zero counts but still list it.
-    }
+      const base = graphFile.slice(0, -'.json'.length);
+      const sibling = (suffix: string) =>
+        fs.existsSync(path.join(svcDir, `${base}.${suffix}`)) ? `${service}/${base}.${suffix}` : null;
 
-    return {
-      name: base,
-      type: isFrontend ? 'frontend' : 'backend',
-      graph: graphFile,
-      openapi: sibling('openapi.json'),
-      impact: sibling('impact.json'),
-      join: sibling('join.json'),
-      screens: sibling('screens.json'),
-      nodes,
-      edges,
-      generated,
-    };
-  });
+      let nodes = 0;
+      let edges = 0;
+      let isFrontend = false;
+      let generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      try {
+        const root = JSON.parse(fs.readFileSync(path.join(svcDir, graphFile), 'utf8'));
+        nodes = int(root.meta, 'nodes') ?? (Array.isArray(root.nodes) ? root.nodes.length : 0);
+        edges = int(root.meta, 'edges') ?? (Array.isArray(root.edges) ? root.edges.length : 0);
+        // Detect type from node layers so a shared dir holding BOTH backend and
+        // frontend graphs is catalogued correctly no matter which tool wrote last.
+        isFrontend = Array.isArray(root.nodes) && root.nodes.some((n: { layer?: string }) => n.layer != null && FRONTEND_LAYERS.has(n.layer));
+        const g = str(root.meta, 'generated');
+        if (g) generated = g;
+      } catch {
+        // Unreadable/non-graph json — keep zero counts but still list it.
+      }
+
+      return {
+        name: service,
+        type: isFrontend ? 'frontend' : 'backend',
+        graph: `${service}/${graphFile}`,
+        openapi: sibling('openapi.json'),
+        impact: sibling('impact.json'),
+        join: sibling('join.json'),
+        screens: sibling('screens.json'),
+        nodes,
+        edges,
+        generated,
+      };
+    })
+    .filter((p): p is NonNullable<typeof p> => p != null);
 
   const manifest = {
     version: 1,
@@ -105,6 +118,7 @@ export function read(text: string): CallGraph {
     returnType: str(n, 'returnType'),
     httpMethod: str(n, 'httpMethod'),
     endpoint: str(n, 'endpoint'),
+    aliases: Array.isArray(n.aliases) ? n.aliases.map((a: unknown) => String(a)) : null,
     externalService: str(n, 'externalService'),
     externalUrl: str(n, 'externalUrl'),
     file: str(n, 'file'),

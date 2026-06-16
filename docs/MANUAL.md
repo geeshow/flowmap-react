@@ -27,7 +27,7 @@ React 정적 분석기의 전체 명령어, 출력 스키마, 내부 동작, 한
 
 ## 1. 철학과 동작 원리
 
-자매 백엔드 도구 `flowmap-spring-kotlin`은 두 가지 구현을 둡니다 — 빠른 Python(정규식 휴리스틱)과
+자매 백엔드 도구 `flowmap-spring`은 두 가지 구현을 둡니다 — 빠른 Python(정규식 휴리스틱)과
 정밀한 Kotlin(컴파일러 K1 프론트엔드, PSI + BindingContext). 이 React 분석기는 **정밀도 우선**
 철학을 따라, JS/TS의 실제 컴파일러인 **TypeScript Compiler API**를 사용합니다.
 
@@ -110,7 +110,7 @@ node dist/cli.js join --graph front.json --backend backend.json [--out join.json
 ```
 
 프론트 그래프의 API/EXTERNAL 노드를 백엔드 그래프의 CONTROLLER 노드에 `(httpMethod, 정규화 경로)`로
-매칭합니다. 백엔드 그래프는 `flowmap-spring-kotlin`의 `analyze`/`combine` 산출물(예: `_combined.json`).
+매칭합니다. 백엔드 그래프는 `flowmap-spring`의 `analyze`/`combine` 산출물(예: `_combined.json`).
 
 ### screens — 화면 와이어프레임 데이터
 
@@ -439,7 +439,7 @@ cd ts-analyzer && npm test     # vitest, 36 tests
 | `screens.spec` | 화면 레이아웃 트리: 라우트·자식 컴포넌트 링크·host/prop/조건 캡처 |
 | `e2e.spec` | `.repo/sample-shop-react` 전체 파이프라인 + 백엔드 `_combined.json` 조인 |
 
-`e2e.spec`는 백엔드 그래프(`../../flowmap-spring-kotlin/.../_combined.json`)가 있으면 조인까지
+`e2e.spec`는 백엔드 그래프(`../../flowmap-spring/.../_combined.json`)가 있으면 조인까지
 검증하고, 없으면 해당 단언을 건너뜁니다.
 
 ---

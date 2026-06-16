@@ -41,6 +41,7 @@ export interface MethodNode {
   returnType: string | null;
   httpMethod: string | null; // API/EXTERNAL verb, or controller verb (backend)
   endpoint: string | null; // normalized path — THE join basis
+  aliases?: string[] | null; // ADDITIVE — alternate match keys (e.g. nexcore .jmd transaction id); join segment-probe tier
   externalService: string | null; // axios instance / wrapper module / host
   externalUrl: string | null; // raw resolved URL (display)
   file: string | null; // repo-relative
