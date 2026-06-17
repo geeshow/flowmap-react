@@ -165,6 +165,33 @@ function readGraphFile(p: string): CallGraph {
   return jsonOutput.read(fs.readFileSync(p, 'utf8'));
 }
 
+/**
+ * The analyzed root (repo-relative) a graph records in `meta.root` — e.g.
+ * `front-official-desktop` for a standalone repo, `my-mono/packages/web` for a
+ * monorepo package. Drives impact's git-target resolution. Falls back to
+ * `meta.project`, then '' (the repo root).
+ */
+function readGraphMetaRoot(graphPath: string): string {
+  try {
+    const meta = JSON.parse(fs.readFileSync(graphPath, 'utf8')).meta ?? {};
+    return String(meta.root ?? meta.project ?? '');
+  } catch {
+    return '';
+  }
+}
+
+/** In-graph changed node ids recorded in an existing PR shard — for incremental aggregate union. */
+function readShardChangedInGraph(shardDir: string, prNumber: number): string[] {
+  try {
+    const shard = JSON.parse(fs.readFileSync(path.join(shardDir, `${prNumber}.json`), 'utf8'));
+    return ((shard.changedNodes as Array<{ id: string; inGraph?: boolean }>) ?? [])
+      .filter((c) => c?.inGraph)
+      .map((c) => c.id);
+  } catch {
+    return [];
+  }
+}
+
 async function graphFromOpts(opts: Opts): Promise<CallGraph> {
   if (opts.flags['--graph']) return readGraphFile(opts.flags['--graph']);
   return (await analyzeRepo(opts)).graph;
@@ -560,54 +587,123 @@ async function cmdStats(opts: Opts): Promise<void> {
  * shards (pruning shards for PRs no longer in the window).
  */
 function cmdImpact(opts: Opts): void {
-  const repo = path.resolve(opts.flags['--git'] ?? opts.flags['--repo'] ?? '.');
-  if (!gitSource.isRepo(repo)) {
-    process.stderr.write(`impact: ${repo} is not a git work tree (pass --git <repo>)\n`);
-    process.exit(2);
-  }
   const graphPath = opts.flags['--graph'];
   if (!graphPath) {
     process.stderr.write('impact: --graph <graph.json> required\n');
     process.exit(2);
   }
   const graph = readGraphFile(graphPath);
+
+  // Resolve the git work tree to mine + the path prefix that maps its blob paths
+  // onto the graph's repo-relative node ids:
+  //  - explicit --git: use it as-is (prefix from --prefix, else the repo basename);
+  //  - else --repo-root: derive from the graph's meta.root, walking up to the
+  //    nearest git work tree. A package split out of a MONOREPO thus mines the
+  //    monorepo's git with the right prefix (its repo-relative dir) instead of
+  //    looking for a standalone repo at the flattened service name (which fails).
+  let repo: string;
+  let prefix: string;
+  if (opts.flags['--git']) {
+    repo = path.resolve(opts.flags['--git']);
+    prefix = opts.flags['--prefix'] ?? path.basename(repo);
+  } else {
+    const repoRoot = opts.flags['--repo-root'] ?? opts.flags['--repo'];
+    if (!repoRoot) {
+      process.stderr.write('impact: pass --git <repo>, or --repo-root <dir> with a graph carrying meta.root\n');
+      process.exit(2);
+    }
+    const projectRel = readGraphMetaRoot(graphPath);
+    const target = gitSource.resolveGitTarget(path.resolve(repoRoot), projectRel);
+    if (!target) {
+      process.stderr.write(`impact: no git work tree at/above ${path.join(repoRoot, projectRel) || repoRoot} — skipping\n`);
+      process.exit(1);
+    }
+    repo = target.gitDir;
+    prefix = opts.flags['--prefix'] ?? target.prefix;
+  }
+  if (!gitSource.isRepo(repo)) {
+    process.stderr.write(`impact: ${repo} is not a git work tree\n`);
+    process.exit(2);
+  }
+
   const base = gitSource.resolveBranch(repo, opts.flags['--base'] ?? null);
   if (!base) {
     process.stderr.write(`impact: cannot resolve a branch to mine in ${repo} (pass --base)\n`);
     process.exit(1);
   }
-  // Project-dir prefix prepended to git paths so blob ids match graph node ids.
-  const prefix = opts.flags['--prefix'] ?? path.basename(repo);
   const max = parseInt(opts.flags['--max'] ?? '10', 10) || 10;
+  const out = opts.flags['--out'];
 
-  const pulls = gitSource.mergedPulls(repo, base, max);
-  if (pulls == null) {
+  // Incremental: reuse the PRs already recorded in <out>, mining only those merged
+  // SINCE the newest analyzed date (or an explicit --since). The expensive per-PR
+  // diff/parse then runs for NEW PRs only; existing rows + shards are kept and the
+  // index is merged. First run (no <out>) transparently falls back to a full run.
+  const incremental = '--incremental' in opts.flags && !!out;
+  let existingIndex: Record<string, unknown> | null = null;
+  const analyzedNumbers = new Set<number>();
+  let since = opts.flags['--since'] || null;
+  if (incremental && out && fs.existsSync(out)) {
+    try {
+      existingIndex = JSON.parse(fs.readFileSync(out, 'utf8'));
+      for (const p of ((existingIndex?.pulls as Array<{ number?: number; mergedAt?: string }>) ?? [])) {
+        if (Number.isFinite(p?.number)) analyzedNumbers.add(p.number as number);
+        if (p?.mergedAt && (!since || String(p.mergedAt) > since)) since = String(p.mergedAt);
+      }
+    } catch {
+      existingIndex = null; // unreadable prior index → full run
+    }
+  }
+
+  // Incremental scans wide (the git log is one cheap call) and bounds by `since`
+  // so no recent PR is missed; a full run honors --max.
+  const mined = gitSource.mergedPulls(repo, base, incremental ? 5000 : max, incremental ? since : null);
+  if (mined == null) {
     process.stderr.write(`impact: no PR source for base ${base} (no git PR markers + gh unavailable)\n`);
     process.exit(1);
   }
+  const pulls = incremental ? mined.filter((p) => !analyzedNumbers.has(p.number)) : mined;
+
+  // Nothing new since the last run — leave the existing index + shards untouched.
+  if (incremental && existingIndex && pulls.length === 0) {
+    process.stderr.write(`impact: ${out} already current — 0 new PRs since ${since ?? 'last run'}\n`);
+    return;
+  }
+
   const result = impact.analyze(repo, base, prefix, pulls, graph);
-  const out = opts.flags['--out'];
   if (!out) {
     process.stdout.write(jsonOutput.writeValue(result.index) + '\n');
     return;
   }
-  fs.writeFileSync(out, jsonOutput.writeValue(result.index));
-  // heavy per-PR shards under `<base>.impact/`, pruning stale ones
+
   const shardDir = impact.shardDirOf(out);
   fs.mkdirSync(shardDir, { recursive: true });
-  const keep = new Set<string>();
+
+  // Index: merge into the existing one when running incrementally; else replace.
+  const index =
+    incremental && existingIndex
+      ? impact.mergeIndex(existingIndex, result, (num) => readShardChangedInGraph(shardDir, num))
+      : result.index;
+  fs.writeFileSync(out, jsonOutput.writeValue(index));
+
+  // Write this run's heavy per-PR shards. A full run also prunes shards no longer
+  // referenced; an incremental run keeps the existing shards (they back retained PRs).
   for (const [number, shard] of result.shards) {
     fs.writeFileSync(path.join(shardDir, `${number}.json`), jsonOutput.writeValue(shard));
-    keep.add(`${number}.json`);
   }
-  try {
-    for (const f of fs.readdirSync(shardDir)) if (f.endsWith('.json') && !keep.has(f)) fs.unlinkSync(path.join(shardDir, f));
-    if (fs.readdirSync(shardDir).length === 0) fs.rmdirSync(shardDir);
-  } catch {
-    /* shard-dir prune is best-effort */
+  if (!incremental) {
+    const keep = new Set([...result.shards.keys()].map((n) => `${n}.json`));
+    try {
+      for (const f of fs.readdirSync(shardDir)) if (f.endsWith('.json') && !keep.has(f)) fs.unlinkSync(path.join(shardDir, f));
+      if (fs.readdirSync(shardDir).length === 0) fs.rmdirSync(shardDir);
+    } catch {
+      /* shard-dir prune is best-effort */
+    }
   }
+
   process.stderr.write(
-    `wrote ${out}: ${pulls.length} PRs, ${result.index.changedNodeCount} changed nodes, ${result.index.impactedEndpointCount} impacted screens\n`,
+    `wrote ${out}: ${pulls.length}${incremental ? ' new' : ''} PRs, ${(index as { pullCount?: number }).pullCount} total, ` +
+      `${(index as { changedNodeCount?: number }).changedNodeCount} changed nodes, ` +
+      `${(index as { impactedEndpointCount?: number }).impactedEndpointCount} impacted screens\n`,
   );
   // Impact output is a sibling of the graph inside the service dir; the catalogue
   // sits one level up at OUT_DIR (refreshManifest takes dirname of its arg).
@@ -636,7 +732,9 @@ function usage(): void {
       '  stats   [--graph g.json | --repo <dir>]',
       '  doctor  [--graph g.json | --repo <dir>] [--max-orphans N]   # graph health: orphans, dangling, connectivity',
       '  screens --repo <dir> [--project P] [--out f.json]   # screen layout/wireframe data',
-      '  impact  --git <repo> --graph g.json [--out f.impact.json] [--base branch] [--max N] [--prefix P]',
+      '  impact  (--git <repo> | --repo-root <.repo>) --graph g.json [--out f.impact.json] [--base branch] [--max N] [--prefix P] [--incremental] [--since DATE]',
+      '          # --repo-root: auto-find the git work tree from the graph meta.root (walks up; monorepo packages mine the monorepo git)',
+      '          # --incremental: reuse PRs already in --out, analyze only those merged since the last run (or --since DATE)',
       '          # per-PR change impact: changed nodes + the screens they reach (git-first, gh fallback)',
       '',
     ].join('\n'),

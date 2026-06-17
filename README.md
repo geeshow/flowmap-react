@@ -181,7 +181,7 @@ flowmap-react/
 ## 검증
 
 ```bash
-cd ts-analyzer && npm test     # 150 tests
+cd ts-analyzer && npm test     # 157 tests
 ```
 
 - `norm.spec` — 조인 키 정규화의 백엔드 바이트 동일성(골든 테이블)

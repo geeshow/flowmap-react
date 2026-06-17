@@ -155,6 +155,62 @@ export function analyze(repo: string, base: string, prefix: string, pulls: git.P
   return { index, shards };
 }
 
+/**
+ * Merge a freshly-analyzed delta ([newResult], the analyze() output for the NEW
+ * pulls only) into an [existing] impact index — for INCREMENTAL runs that reuse
+ * already-analyzed PRs instead of re-mining the whole history.
+ *
+ * Pull rows are unioned (existing ∪ new), deduped by PR number (a re-analyzed PR's
+ * NEW row wins), and sorted newest-first by mergedAt. Aggregates are recomputed
+ * over the union: `impactedEndpointCount` from each row's `impactedEndpoints` ids
+ * (carried in the index — no shard read), and `changedNodeCount` from the in-graph
+ * changed node ids — taken from [newResult] shards for new PRs and from
+ * [existingChangedInGraph] (a per-number reader over the existing shard files) for
+ * the rest, so the count stays an exact union without re-running git/parse.
+ *
+ * Returns the merged index. Shards on disk are the union of the kept existing shard
+ * files (left in place) and [newResult].shards (written by the caller); nothing is
+ * pruned, since every existing PR is retained.
+ */
+export function mergeIndex(
+  existing: Record<string, any>,
+  newResult: ImpactResult,
+  existingChangedInGraph: (prNumber: number) => string[],
+): Record<string, unknown> {
+  const byNumber = new Map<number, any>();
+  for (const r of (existing.pulls as any[]) ?? []) byNumber.set(r.number, r);
+  for (const r of (newResult.index.pulls as any[]) ?? []) byNumber.set(r.number, r); // new wins on re-analysis
+  const rows = [...byNumber.values()].sort((a, b) => {
+    const da = String(a.mergedAt ?? ''), db = String(b.mergedAt ?? '');
+    if (da !== db) return da < db ? 1 : -1; // newest mergedAt first
+    return (b.number ?? 0) - (a.number ?? 0);
+  });
+
+  const impacted = new Set<string>();
+  const changed = new Set<string>();
+  for (const r of rows) {
+    for (const e of (r.impactedEndpoints as any[]) ?? []) if (e?.id) impacted.add(e.id);
+    const shard = newResult.shards.get(r.number);
+    const ids = shard
+      ? ((shard.changedNodes as any[]) ?? []).filter((c) => c.inGraph).map((c) => c.id as string)
+      : existingChangedInGraph(r.number);
+    for (const id of ids) changed.add(id);
+  }
+
+  return {
+    base: existing.base ?? newResult.index.base,
+    repoUrl: newResult.index.repoUrl ?? existing.repoUrl ?? null,
+    pullCount: rows.length,
+    changedNodeCount: changed.size,
+    impactedEndpointCount: impacted.size,
+    deletedEndpointCount: 0,
+    trulyDeletedEndpointCount: 0,
+    breakingDeletionCount: 0,
+    pulls: rows,
+    deletedEndpoints: [],
+  };
+}
+
 function parseBlob(content: string | null, idPath: string): FnRange[] {
   if (content == null) return [];
   try {

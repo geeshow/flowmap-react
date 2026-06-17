@@ -7,8 +7,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { parseGitLog, parseDiff, parseGhList, toWebBase } from '../src/impact/git';
+import { parseGitLog, parseDiff, parseGhList, toWebBase, resolveGitTarget } from '../src/impact/git';
 import { functions } from '../src/impact/fileParser';
+import { mergeIndex, ImpactResult } from '../src/impact/impact';
 
 // Build a record-formatted git log the way `--pretty=format:%H\x1f%cI\x1f%an\x1f%s\x1f%b\x1e` does.
 function rec(sha: string, date: string, author: string, subject: string, body = ''): string {
@@ -88,6 +89,115 @@ describe('toWebBase', () => {
     expect(toWebBase('ssh://git@github.com/owner/repo.git')).toBe('https://github.com/owner/repo');
     expect(toWebBase('https://user:token@github.com/owner/repo.git')).toBe('https://github.com/owner/repo');
     expect(toWebBase('ftp://nope')).toBeNull();
+  });
+});
+
+describe('resolveGitTarget — git work tree + prefix (standalone vs monorepo)', () => {
+  const repoRoot = '/r';
+  // Predicate stand-in for the on-disk `.git` check: the given absolute dirs are git roots.
+  const gitRootsAt = (...dirs: string[]) => (d: string) => dirs.includes(d);
+
+  it('standalone checkout: git root IS the project dir, prefix is its repo-relative name', () => {
+    const t = resolveGitTarget(repoRoot, 'front-official-desktop', gitRootsAt('/r/front-official-desktop'));
+    expect(t).toEqual({ gitDir: '/r/front-official-desktop', prefix: 'front-official-desktop' });
+  });
+
+  it('monorepo package: walks up to the monorepo git root; prefix is the monorepo dir', () => {
+    // .repo/my-mono is the git work tree; packages/web is a split-out root with no .git of its own.
+    const t = resolveGitTarget(repoRoot, 'my-mono/packages/web', gitRootsAt('/r/my-mono'));
+    expect(t).toEqual({ gitDir: '/r/my-mono', prefix: 'my-mono' });
+    // The prefix must reconstruct a repo-relative node file from a git-root-relative blob path
+    // (git diff yields `packages/web/...`; the graph node file is `my-mono/packages/web/...`).
+    expect(`${t!.prefix}/packages/web/src/App.tsx`).toBe('my-mono/packages/web/src/App.tsx');
+  });
+
+  it('two packages of the same monorepo resolve to the same git, each with the monorepo prefix', () => {
+    const web = resolveGitTarget(repoRoot, 'my-mono/packages/web', gitRootsAt('/r/my-mono'));
+    const api = resolveGitTarget(repoRoot, 'my-mono/apps/api', gitRootsAt('/r/my-mono'));
+    expect(web!.gitDir).toBe('/r/my-mono');
+    expect(api!.gitDir).toBe('/r/my-mono');
+    expect(web!.prefix).toBe('my-mono');
+    expect(api!.prefix).toBe('my-mono');
+  });
+
+  it('returns null when no git work tree exists at or above the project (within repoRoot)', () => {
+    expect(resolveGitTarget(repoRoot, 'my-mono/packages/web', gitRootsAt('/elsewhere'))).toBeNull();
+    // never walks above repoRoot, so a git root only at `/` is not used
+    expect(resolveGitTarget(repoRoot, 'a/b', gitRootsAt('/'))).toBeNull();
+  });
+
+  it('repoRoot itself as the git root yields an empty prefix (paths already repo-relative)', () => {
+    expect(resolveGitTarget(repoRoot, 'a/b', gitRootsAt('/r'))).toEqual({ gitDir: '/r', prefix: '' });
+  });
+});
+
+describe('mergeIndex — incremental merge of a new delta into an existing index', () => {
+  // existing: PR #10 (older). Its in-graph changed id comes from its shard on disk,
+  // supplied here via the injected reader.
+  const existing = {
+    base: 'main',
+    repoUrl: 'https://github.com/o/r',
+    pullCount: 1,
+    changedNodeCount: 1,
+    impactedEndpointCount: 1,
+    pulls: [
+      {
+        number: 10,
+        title: 'old pr',
+        author: 'a',
+        mergedAt: '2026-01-01T00:00:00Z',
+        mergeCommit: 'sha10',
+        changedNodeCount: 1,
+        changedFileCount: 1,
+        impactedEndpoints: [{ id: 'app/Home.tsx::Home', httpMethod: null, endpoint: '/', service: 'web' }],
+      },
+    ],
+  };
+  // new delta: PR #11 (newer) — analyze() output for the new pulls only.
+  const newResult: ImpactResult = {
+    index: {
+      base: 'main',
+      repoUrl: 'https://github.com/o/r',
+      pullCount: 1,
+      changedNodeCount: 1,
+      impactedEndpointCount: 1,
+      pulls: [
+        {
+          number: 11,
+          title: 'new pr',
+          author: 'b',
+          mergedAt: '2026-02-01T00:00:00Z',
+          mergeCommit: 'sha11',
+          changedNodeCount: 1,
+          changedFileCount: 1,
+          impactedEndpoints: [{ id: 'app/Cart.tsx::Cart', httpMethod: null, endpoint: '/cart', service: 'web' }],
+        },
+      ],
+    },
+    shards: new Map([[11, { number: 11, mergeCommit: 'sha11', changedNodes: [{ id: 'app/Cart.tsx::Cart', inGraph: true, visibility: 'public', kind: 'component' }] }]]),
+  };
+  // existing PR #10's in-graph changed ids, as read from its shard file.
+  const existingChanged = (n: number) => (n === 10 ? ['app/Home.tsx::Home'] : []);
+
+  it('unions pulls newest-first and recomputes aggregate counts over both', () => {
+    const m = mergeIndex(existing, newResult, existingChanged) as any;
+    expect(m.pulls.map((p: any) => p.number)).toEqual([11, 10]); // newest mergedAt first
+    expect(m.pullCount).toBe(2);
+    expect(m.changedNodeCount).toBe(2); // Home (existing shard) ∪ Cart (new shard)
+    expect(m.impactedEndpointCount).toBe(2); // Home + Cart screens
+    expect(m.base).toBe('main');
+  });
+
+  it('re-analyzed PR: the new row + shard win, no duplicate row', () => {
+    const reanalyzed: ImpactResult = {
+      index: { pulls: [{ ...(newResult.index.pulls as any[])[0], number: 10, title: 'reanalyzed', mergedAt: '2026-03-01T00:00:00Z', impactedEndpoints: [] }] },
+      shards: new Map([[10, { number: 10, changedNodes: [{ id: 'app/Home.tsx::Home', inGraph: true }, { id: 'app/Home.tsx::Sidebar', inGraph: true }] }]]),
+    };
+    const m = mergeIndex(existing, reanalyzed, existingChanged) as any;
+    expect(m.pulls).toHaveLength(1);
+    expect(m.pulls[0].title).toBe('reanalyzed');
+    expect(m.changedNodeCount).toBe(2); // from the NEW shard (Home + Sidebar), not the stale reader
+    expect(m.impactedEndpointCount).toBe(0);
   });
 });
 
