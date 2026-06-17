@@ -67,6 +67,7 @@ export function writeManifest(outDir: string): string {
       let nodes = 0;
       let edges = 0;
       let isFrontend = false;
+      let repo: string | null = null;
       let generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
       try {
         const root = JSON.parse(fs.readFileSync(path.join(svcDir, graphFile), 'utf8'));
@@ -75,6 +76,9 @@ export function writeManifest(outDir: string): string {
         // Detect type from node layers so a shared dir holding BOTH backend and
         // frontend graphs is catalogued correctly no matter which tool wrote last.
         isFrontend = Array.isArray(root.nodes) && root.nodes.some((n: { layer?: string }) => n.layer != null && FRONTEND_LAYERS.has(n.layer));
+        // git work tree this service belongs to (the frontend analyzer stamps it):
+        // monorepo sub-roots share one `repo`, so repo-level views can group them.
+        repo = str(root.meta, 'gitRepo');
         const g = str(root.meta, 'generated');
         if (g) generated = g;
       } catch {
@@ -84,6 +88,7 @@ export function writeManifest(outDir: string): string {
       return {
         name: service,
         type: isFrontend ? 'frontend' : 'backend',
+        repo,
         graph: `${service}/${graphFile}`,
         openapi: sibling('openapi.json'),
         impact: sibling('impact.json'),

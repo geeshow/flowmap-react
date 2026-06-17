@@ -253,14 +253,20 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
   if (out && services.length >= 1) {
     const dir = path.dirname(out) || '.';
     const base = path.basename(out, '.json');
+    const repoRootAbs = path.resolve(repo);
     for (const s of services) {
       const svcDir = path.join(dir, s.name);
       fs.mkdirSync(svcDir, { recursive: true });
+      // The git work tree this service belongs to (its monorepo, or itself). Lets
+      // the manifest group sibling sub-roots under one repo so repo-level views
+      // (deploy → service mapping, PR impact) aren't fooled by the flattened name.
+      const gitRepo = path.basename(gitSource.resolveGitTarget(repoRootAbs, s.root)?.gitDir ?? '') || null;
       dump(s.graph, path.join(svcDir, `${base}.json`), {
         command: 'analyze',
         repo,
         project: s.name,
         root: s.root,
+        gitRepo,
         files: s.fileCount,
         nodes: s.graph.nodes.length,
         edges: s.graph.edges.length,
@@ -586,62 +592,34 @@ async function cmdStats(opts: Opts): Promise<void> {
  * nodes they reach. Writes a lean `<out>` index + heavy `<base>.impact/<n>.json`
  * shards (pruning shards for PRs no longer in the window).
  */
-function cmdImpact(opts: Opts): void {
-  const graphPath = opts.flags['--graph'];
-  if (!graphPath) {
-    process.stderr.write('impact: --graph <graph.json> required\n');
-    process.exit(2);
-  }
-  const graph = readGraphFile(graphPath);
-
-  // Resolve the git work tree to mine + the path prefix that maps its blob paths
-  // onto the graph's repo-relative node ids:
-  //  - explicit --git: use it as-is (prefix from --prefix, else the repo basename);
-  //  - else --repo-root: derive from the graph's meta.root, walking up to the
-  //    nearest git work tree. A package split out of a MONOREPO thus mines the
-  //    monorepo's git with the right prefix (its repo-relative dir) instead of
-  //    looking for a standalone repo at the flattened service name (which fails).
-  let repo: string;
-  let prefix: string;
-  if (opts.flags['--git']) {
-    repo = path.resolve(opts.flags['--git']);
-    prefix = opts.flags['--prefix'] ?? path.basename(repo);
-  } else {
-    const repoRoot = opts.flags['--repo-root'] ?? opts.flags['--repo'];
-    if (!repoRoot) {
-      process.stderr.write('impact: pass --git <repo>, or --repo-root <dir> with a graph carrying meta.root\n');
-      process.exit(2);
-    }
-    const projectRel = readGraphMetaRoot(graphPath);
-    const target = gitSource.resolveGitTarget(path.resolve(repoRoot), projectRel);
-    if (!target) {
-      process.stderr.write(`impact: no git work tree at/above ${path.join(repoRoot, projectRel) || repoRoot} — skipping\n`);
-      process.exit(1);
-    }
-    repo = target.gitDir;
-    prefix = opts.flags['--prefix'] ?? target.prefix;
-  }
-  if (!gitSource.isRepo(repo)) {
-    process.stderr.write(`impact: ${repo} is not a git work tree\n`);
-    process.exit(2);
-  }
-
-  const base = gitSource.resolveBranch(repo, opts.flags['--base'] ?? null);
+/**
+ * Analyze PR change-impact for ONE git repo against [graph] (already merged across
+ * the repo's sub-roots), writing the index + per-PR shards to [out]. Returns false
+ * when there is nothing to write (no branch / no PR source) so a caller looping over
+ * many repos can skip without aborting; true when it wrote or was already current.
+ * Does not call process.exit. Mirrors the incremental contract of `impact`.
+ */
+function runImpact(
+  graph: CallGraph,
+  repo: string,
+  prefix: string,
+  out: string | undefined,
+  o: { incremental: boolean; max: number; since: string | null; base: string | null },
+): boolean {
+  const base = gitSource.resolveBranch(repo, o.base);
   if (!base) {
     process.stderr.write(`impact: cannot resolve a branch to mine in ${repo} (pass --base)\n`);
-    process.exit(1);
+    return false;
   }
-  const max = parseInt(opts.flags['--max'] ?? '10', 10) || 10;
-  const out = opts.flags['--out'];
 
   // Incremental: reuse the PRs already recorded in <out>, mining only those merged
-  // SINCE the newest analyzed date (or an explicit --since). The expensive per-PR
+  // SINCE the newest analyzed date (or an explicit since). The expensive per-PR
   // diff/parse then runs for NEW PRs only; existing rows + shards are kept and the
-  // index is merged. First run (no <out>) transparently falls back to a full run.
-  const incremental = '--incremental' in opts.flags && !!out;
+  // index merged. First run (no <out>) transparently falls back to a full run.
+  const incremental = o.incremental && !!out;
   let existingIndex: Record<string, unknown> | null = null;
   const analyzedNumbers = new Set<number>();
-  let since = opts.flags['--since'] || null;
+  let since = o.since;
   if (incremental && out && fs.existsSync(out)) {
     try {
       existingIndex = JSON.parse(fs.readFileSync(out, 'utf8'));
@@ -655,24 +633,24 @@ function cmdImpact(opts: Opts): void {
   }
 
   // Incremental scans wide (the git log is one cheap call) and bounds by `since`
-  // so no recent PR is missed; a full run honors --max.
-  const mined = gitSource.mergedPulls(repo, base, incremental ? 5000 : max, incremental ? since : null);
+  // so no recent PR is missed; a full run honors max.
+  const mined = gitSource.mergedPulls(repo, base, incremental ? 5000 : o.max, incremental ? since : null);
   if (mined == null) {
     process.stderr.write(`impact: no PR source for base ${base} (no git PR markers + gh unavailable)\n`);
-    process.exit(1);
+    return false;
   }
   const pulls = incremental ? mined.filter((p) => !analyzedNumbers.has(p.number)) : mined;
 
   // Nothing new since the last run — leave the existing index + shards untouched.
   if (incremental && existingIndex && pulls.length === 0) {
     process.stderr.write(`impact: ${out} already current — 0 new PRs since ${since ?? 'last run'}\n`);
-    return;
+    return true;
   }
 
   const result = impact.analyze(repo, base, prefix, pulls, graph);
   if (!out) {
     process.stdout.write(jsonOutput.writeValue(result.index) + '\n');
-    return;
+    return true;
   }
 
   const shardDir = impact.shardDirOf(out);
@@ -708,6 +686,148 @@ function cmdImpact(opts: Opts): void {
   // Impact output is a sibling of the graph inside the service dir; the catalogue
   // sits one level up at OUT_DIR (refreshManifest takes dirname of its arg).
   refreshManifest(path.dirname(out));
+  return true;
+}
+
+function cmdImpact(opts: Opts): void {
+  const graphArg = opts.flags['--graph'];
+  if (!graphArg) {
+    process.stderr.write('impact: --graph <graph.json[,graph2.json]> required\n');
+    process.exit(2);
+  }
+  // Multiple graphs (CSV) are MERGED into one — used for a monorepo's sub-roots,
+  // which share a git work tree + prefix; impact then maps each PR's changed files
+  // to whichever sub-root owns them, in a single pass.
+  const graphPaths = graphArg.split(',').map((s) => s.trim()).filter(Boolean);
+  const graph = graphPaths.length === 1 ? readGraphFile(graphPaths[0]) : mergeGraphs(graphPaths.map(readGraphFile));
+
+  // Resolve the git work tree to mine + the path prefix that maps its blob paths
+  // onto the graph's repo-relative node ids:
+  //  - explicit --git: use it as-is (prefix from --prefix, else the repo basename);
+  //  - else --repo-root: derive from the (first) graph's meta.root, walking up to
+  //    the nearest git work tree. A package split out of a MONOREPO thus mines the
+  //    monorepo's git with the right prefix (its repo-relative dir) instead of
+  //    looking for a standalone repo at the flattened service name (which fails).
+  let repo: string;
+  let prefix: string;
+  if (opts.flags['--git']) {
+    repo = path.resolve(opts.flags['--git']);
+    prefix = opts.flags['--prefix'] ?? path.basename(repo);
+  } else {
+    const repoRoot = opts.flags['--repo-root'] ?? opts.flags['--repo'];
+    if (!repoRoot) {
+      process.stderr.write('impact: pass --git <repo>, or --repo-root <dir> with a graph carrying meta.root\n');
+      process.exit(2);
+    }
+    const projectRel = readGraphMetaRoot(graphPaths[0]);
+    const target = gitSource.resolveGitTarget(path.resolve(repoRoot), projectRel);
+    if (!target) {
+      process.stderr.write(`impact: no git work tree at/above ${path.join(repoRoot, projectRel) || repoRoot} — skipping\n`);
+      process.exit(1);
+    }
+    repo = target.gitDir;
+    prefix = opts.flags['--prefix'] ?? target.prefix;
+  }
+  if (!gitSource.isRepo(repo)) {
+    process.stderr.write(`impact: ${repo} is not a git work tree\n`);
+    process.exit(2);
+  }
+
+  const ok = runImpact(graph, repo, prefix, opts.flags['--out'], {
+    incremental: '--incremental' in opts.flags,
+    max: parseInt(opts.flags['--max'] ?? '10', 10) || 10,
+    since: opts.flags['--since'] || null,
+    base: opts.flags['--base'] ?? null,
+  });
+  if (!ok) process.exit(1);
+}
+
+/** Per-service graph files under a per-service-dir output root (`<out-dir>/<svc>/<base>.json`). */
+function discoverServiceGraphs(outDir: string): string[] {
+  const derived = /\.(join|screens|openapi|impact)\.json$/;
+  let subs: fs.Dirent[];
+  try {
+    subs = fs.readdirSync(outDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const graphs: string[] = [];
+  for (const d of subs) {
+    if (!d.isDirectory()) continue;
+    const svcDir = path.join(outDir, d.name);
+    const g = fs.readdirSync(svcDir).find((f) => f.endsWith('.json') && !f.startsWith('_') && !derived.test(f));
+    if (g) graphs.push(path.join(svcDir, g));
+  }
+  return graphs.sort();
+}
+
+/** Remove a service's impact index + shard dir (used to clear non-representative sub-roots). */
+function pruneImpactArtifacts(graphPath: string): void {
+  const idx = graphPath.replace(/\.json$/, '.impact.json');
+  const dir = graphPath.replace(/\.json$/, '.impact');
+  try {
+    if (fs.existsSync(idx)) fs.unlinkSync(idx);
+  } catch {
+    /* best-effort */
+  }
+  try {
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Repo-level PR change-impact over a per-service output dir: discover every service
+ * graph, group them by their resolved git work tree (so a monorepo's sub-roots fall
+ * in one group), and run impact ONCE per repo against the MERGED graph of the group.
+ * The result is written to the group's representative sub-root (the first by path),
+ * and the other sub-roots' stale impact artifacts are pruned — so each repo carries
+ * a single, deduplicated impact spanning all its packages.
+ */
+function cmdImpactRepos(opts: Opts): void {
+  const repoRoot = opts.flags['--repo-root'] ?? opts.flags['--repo'];
+  const outDir = opts.flags['--out-dir'];
+  if (!repoRoot || !outDir) {
+    process.stderr.write('impact-repos: --repo-root <.repo> and --out-dir <service-dir root> required\n');
+    process.exit(2);
+  }
+  const repoRootAbs = path.resolve(repoRoot);
+  const max = parseInt(opts.flags['--max'] ?? '10', 10) || 10;
+  const incremental = '--incremental' in opts.flags;
+  const since = opts.flags['--since'] || null;
+
+  // group graphs by resolved git work tree
+  const groups = new Map<string, { gitDir: string; prefix: string; graphs: string[] }>();
+  for (const gp of discoverServiceGraphs(outDir)) {
+    const target = gitSource.resolveGitTarget(repoRootAbs, readGraphMetaRoot(gp));
+    if (!target) {
+      process.stderr.write(`  · ${path.basename(path.dirname(gp))}: skip (no git work tree at/above its checkout)\n`);
+      continue;
+    }
+    const grp = groups.get(target.gitDir) ?? { gitDir: target.gitDir, prefix: target.prefix, graphs: [] };
+    grp.graphs.push(gp);
+    groups.set(target.gitDir, grp);
+  }
+
+  let analyzed = 0;
+  for (const grp of groups.values()) {
+    const sorted = grp.graphs.slice().sort();
+    const repr = sorted[0];
+    const out = repr.replace(/\.json$/, '.impact.json');
+    // A monorepo group: clear any stale per-sub-root impact on the non-representatives
+    // so the manifest links the repo's single impact only (no duplicates).
+    for (const g of sorted.slice(1)) pruneImpactArtifacts(g);
+    if (!gitSource.isRepo(grp.gitDir)) {
+      process.stderr.write(`  · ${path.basename(grp.gitDir)}: skip (not a git work tree)\n`);
+      continue;
+    }
+    const label = sorted.length > 1 ? `${path.basename(grp.gitDir)} (${sorted.length} sub-roots)` : path.basename(path.dirname(repr));
+    process.stderr.write(`      ${label} → ${out}\n`);
+    const merged = sorted.length === 1 ? readGraphFile(sorted[0]) : mergeGraphs(sorted.map(readGraphFile));
+    if (runImpact(merged, grp.gitDir, grp.prefix, out, { incremental, max, since, base: opts.flags['--base'] ?? null })) analyzed++;
+  }
+  process.stderr.write(`impact-repos done: ${analyzed}/${groups.size} repo(s) analyzed\n`);
 }
 
 function countBy<T>(items: T[], key: (t: T) => string): Record<string, number> {
@@ -735,6 +855,9 @@ function usage(): void {
       '  impact  (--git <repo> | --repo-root <.repo>) --graph g.json [--out f.impact.json] [--base branch] [--max N] [--prefix P] [--incremental] [--since DATE]',
       '          # --repo-root: auto-find the git work tree from the graph meta.root (walks up; monorepo packages mine the monorepo git)',
       '          # --incremental: reuse PRs already in --out, analyze only those merged since the last run (or --since DATE)',
+      '          # --graph a.json,b.json: merge several sub-root graphs (one monorepo) and analyze their shared git once',
+      '  impact-repos --repo-root <.repo> --out-dir <service-dir root> [--max N] [--incremental] [--since DATE]',
+      '          # group every service graph by git work tree and analyze impact ONCE per repo (monorepo sub-roots share one impact)',
       '          # per-PR change impact: changed nodes + the screens they reach (git-first, gh fallback)',
       '',
     ].join('\n'),
@@ -789,6 +912,9 @@ async function main(): Promise<void> {
       break;
     case 'impact':
       cmdImpact(opts);
+      break;
+    case 'impact-repos':
+      cmdImpactRepos(opts);
       break;
     case '-h':
     case '--help':
