@@ -13,6 +13,8 @@
  */
 
 import { spawnSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface Pr {
   number: number;
@@ -47,6 +49,49 @@ function git(repo: string, args: string[]): { out: string; code: number } {
 
 export function isRepo(repo: string): boolean {
   return git(repo, ['rev-parse', '--is-inside-work-tree']).out.trim() === 'true';
+}
+
+/** True when [dir] is a git work-tree ROOT (holds a `.git` dir or file). */
+export function hasGitDir(dir: string): boolean {
+  return fs.existsSync(path.join(dir, '.git'));
+}
+
+/**
+ * Resolve which git work tree to mine for a service graph, and the path prefix
+ * that maps that tree's blob paths onto the graph's repo-relative node ids.
+ *
+ * A service's analyzed root is `<repoRoot>/<projectRootRel>` (the graph's
+ * `meta.root`). Its git work tree is the NEAREST ancestor — the project dir
+ * itself or upward, bounded at [repoRoot] — that is a git root: for a standalone
+ * checkout that's the project dir; for a package split out of a MONOREPO it's the
+ * monorepo root (the package dir has no `.git` of its own).
+ *
+ * The prefix is that git root's repo-relative path, because a diff's blob paths
+ * are git-root-relative while graph node files are repoRoot-relative:
+ *   `prefix + "/" + <blobPath>` === `<nodeFile>`   (prefix is '' when the git root IS repoRoot).
+ * So a monorepo package mines the monorepo git with prefix `<monorepo-dir>`, not
+ * the flattened service name — which is why the per-package graph's nodes match.
+ *
+ * Returns null when no git work tree exists at or above the project dir (within
+ * repoRoot) — e.g. an analyzed checkout that was never a git repo. [isGitRoot] is
+ * injectable for testing; it defaults to a `.git` existence check on disk.
+ */
+export function resolveGitTarget(
+  repoRoot: string,
+  projectRootRel: string,
+  isGitRoot: (absDir: string) => boolean = hasGitDir,
+): { gitDir: string; prefix: string } | null {
+  const repoAbs = path.resolve(repoRoot);
+  let dir = path.resolve(repoAbs, projectRootRel);
+  for (;;) {
+    if (isGitRoot(dir)) {
+      return { gitDir: dir, prefix: path.relative(repoAbs, dir).split(path.sep).join('/') };
+    }
+    if (dir === repoAbs) return null; // never walk above the repo root
+    const parent = path.dirname(dir);
+    if (parent === dir) return null; // filesystem root
+    dir = parent;
+  }
 }
 
 /** Currently checked-out branch, or "HEAD" if detached. */
@@ -110,20 +155,25 @@ const SQUASH_PR = /\(#(\d+)\)\s*$/;
  * Newest-first merged PRs targeting [base], capped at [limit]. GIT-FIRST; falls
  * back to `gh pr list` only when git yields nothing. Returns null only when BOTH
  * sources are unavailable (distinct from an empty list = source ran, no PRs).
+ *
+ * [since] (an ISO date) bounds the git scan to commits at/after that time — used
+ * by incremental runs to mine only PRs merged since the last analysis. It applies
+ * to the git path only; the `gh` fallback ignores it (dedup-by-number keeps the
+ * merged output correct regardless).
  */
-export function mergedPulls(repo: string, base: string | null, limit: number): Pr[] | null {
-  const fromGit = gitMergedPulls(repo, base ?? 'HEAD', limit);
+export function mergedPulls(repo: string, base: string | null, limit: number, since?: string | null): Pr[] | null {
+  const fromGit = gitMergedPulls(repo, base ?? 'HEAD', limit, since);
   if (fromGit.length) return fromGit;
   return ghMergedPulls(repo, base, limit);
 }
 
-/** PR set parsed from `git log --first-parent` (merge + squash markers). */
-export function gitMergedPulls(repo: string, base: string, limit: number): Pr[] {
+/** PR set parsed from `git log --first-parent` (merge + squash markers). [since] bounds by date. */
+export function gitMergedPulls(repo: string, base: string, limit: number, since?: string | null): Pr[] {
   // \x1f field sep, \x1e record sep — safe across multi-line bodies.
-  const { out, code } = git(repo, [
-    'log', '--first-parent', base, '-n', '5000', '--no-color',
-    '--pretty=format:%H%x1f%cI%x1f%an%x1f%s%x1f%b%x1e',
-  ]);
+  const args = ['log', '--first-parent', base, '-n', '5000', '--no-color'];
+  if (since) args.push(`--since=${since}`);
+  args.push('--pretty=format:%H%x1f%cI%x1f%an%x1f%s%x1f%b%x1e');
+  const { out, code } = git(repo, args);
   if (code !== 0) return [];
   return parseGitLog(out, limit);
 }
