@@ -149,11 +149,17 @@ export class GraphBuilder {
     const isExternalHost = host != null;
     const layer: Layer = isExternalHost ? 'EXTERNAL' : 'API';
     const ep = r.endpoint;
+    // Unresolved: keep the url-arg source text (urlHint) in the id so the node is
+    // identifiable (`ext:axios get(endpoints.profile)#unresolved`) rather than a
+    // bare, indistinguishable `ext:axios#unresolved`.
+    const unresolvedId = r.urlHint
+      ? `ext:${r.service ?? 'http'} ${r.urlHint}#unresolved`
+      : `ext:${r.service ?? 'http'}#unresolved`;
     const id = isExternalHost
       ? `ext:${r.httpMethod ?? 'ANY'} ${host}${ep ?? ''}`
       : ep
         ? `ext:${r.httpMethod ?? 'ANY'} ${ep}`
-        : `ext:${r.service ?? 'http'}#unresolved`;
+        : unresolvedId;
     return makeNode({
       id,
       fqcn: r.service ?? 'http',
@@ -162,7 +168,10 @@ export class GraphBuilder {
       httpMethod: r.httpMethod,
       endpoint: ep,
       externalService: host ?? r.service,
-      externalUrl: r.url,
+      // Surface the url-arg expression for unresolved calls so the node card shows
+      // *what* the URL was (`buildPath(id)`), not a blank endpoint. (endpoint stays
+      // null → still excluded from backend joins.)
+      externalUrl: r.url ?? (r.urlHint ? `?(${r.urlHint})` : null),
       urlPlaceholder: r.urlPlaceholder,
       clientPackage: r.clientPackage,
       confidence: r.confidence,

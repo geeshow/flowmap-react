@@ -659,7 +659,25 @@ export class ApiCallResolver {
       clientPackage: raw.clientPackage,
       confidence,
       wrapperChain,
+      // When the URL can't be statically resolved, keep the source text of the url
+      // argument (e.g. `getUserUrl()`, `endpoints.profile`) so an `#unresolved` node
+      // is still identifiable instead of a bare `ext:axios#unresolved`.
+      urlHint: urlValue == null ? this.exprHint(raw.urlExpr) : null,
     };
+  }
+
+  /** Condensed source text of an expression — for labelling unresolved url args. */
+  private exprHint(expr: ts.Expression | undefined): string | null {
+    if (!expr) return null;
+    let text: string;
+    try {
+      text = expr.getText();
+    } catch {
+      return null;
+    }
+    text = text.replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    return text.length > 48 ? text.slice(0, 48) + '…' : text;
   }
 
   private confidence(value: string | null, hasPlaceholder: boolean, verbConfident: boolean): Confidence {
@@ -820,10 +838,26 @@ export class ApiCallResolver {
     if (!ts.isIdentifier(node)) return false;
     const sym = this.checker.getSymbolAtLocation(node);
     const mod = this.importModuleOf(sym);
-    if (mod != null && AXIOS_MODULES.has(mod)) return true;
+    // The callable axios client is ONLY the default (or namespace) import. Named
+    // imports from 'axios' are utilities/types — isCancel, isAxiosError, AxiosError,
+    // CanceledError, AxiosHeaders, spread, all, … — and calling them is NOT an HTTP
+    // request. Treating them as `axios(config)` produced spurious `ext:<fn>#unresolved`
+    // external-call nodes (e.g. a `checkIsCanceledError` helper wrapping `isCancel`).
+    if (mod != null && AXIOS_MODULES.has(mod) && this.isDefaultOrNamespaceImport(sym)) return true;
     // dynamic: const axios = (await import('axios')).default
     const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
     if (decl && ts.isVariableDeclaration(decl) && decl.initializer) return this.isDynamicAxiosExpr(decl.initializer);
+    return false;
+  }
+
+  /** True for `import axios from 'axios'`, `import * as axios from 'axios'`, or the
+   *  explicit `import { default as axios } from 'axios'` — i.e. the axios callable,
+   *  not a named utility/type export. */
+  private isDefaultOrNamespaceImport(sym: ts.Symbol | undefined): boolean {
+    const decl = sym?.declarations?.[0];
+    if (!decl) return false;
+    if (ts.isImportClause(decl) || ts.isNamespaceImport(decl)) return true;
+    if (ts.isImportSpecifier(decl)) return decl.propertyName?.text === 'default';
     return false;
   }
 

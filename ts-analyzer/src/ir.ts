@@ -30,6 +30,7 @@ export interface ApiResolution {
   clientPackage: string | null; // module path of the wrapper/instance
   confidence: Confidence;
   wrapperChain: string[]; // e.g. ["getUser", "http.get"] for debuggability
+  urlHint: string | null; // source text of the url arg when it couldn't be resolved (for #unresolved labels)
 }
 
 export type CallResolution =

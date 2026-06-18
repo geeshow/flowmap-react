@@ -38,6 +38,13 @@ beforeAll(() => {
   file('src/env.ts', `export const API_GW = import.meta.env.VITE_APP_API_GW || process.env.NEXT_PUBLIC_API_GW;\n`);
   file('src/api/gw.ts', `import axios from 'axios';\nimport { API_GW } from '../env';\nconst BASE = \`\${API_GW}/account/v1\`;\nexport const listAccounts = () => axios.get(\`\${BASE}/trading/accounts\`);\n`);
   file('src/pages/Accounts.tsx', `import { listAccounts } from '../api/gw';\nexport const Accounts = () => <button onClick={() => listAccounts()}>a</button>;\n`);
+  // axios NAMED utility imports (isCancel/isAxiosError) are NOT http calls — a helper
+  // wrapping them must not become an `ext:…#unresolved` external-call node.
+  file('src/utils/cancel.ts', `import { isCancel, isAxiosError } from 'axios';\nexport const checkIsCanceledError = (e: any) => isCancel(e);\nexport const checkIsAxiosError = (e: any) => isAxiosError(e);\n`);
+  // a genuinely unresolvable url (a function-call arg const folding can't evaluate):
+  // the node keeps the url-arg source text so it stays identifiable.
+  file('src/api/dyn.ts', `import axios from 'axios';\ndeclare function buildPath(id: string): string;\nexport const fetchDyn = (id: string) => axios.get(buildPath(id));\n`);
+  file('src/pages/Misc.tsx', `import { checkIsCanceledError } from '../utils/cancel';\nimport { fetchDyn } from '../api/dyn';\nexport const Misc = () => <button onClick={() => { checkIsCanceledError({}); fetchDyn('1'); }}>m</button>;\n`);
   const files = new TsResolver().analyzeRoot(dir, dir, { repoRoot: dir, projectFilter: null, env: {}, envProfile: 'sandbox' });
   graph = new GraphBuilder(files).build();
 });
@@ -78,5 +85,20 @@ describe('React HTTP-pattern coverage', () => {
     // Home is a concise-arrow component; its handler calls must produce http edges.
     const http = graph.edges.filter((e) => e.relation === 'http');
     expect(http.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('does not treat axios named utilities (isCancel/isAxiosError) as http calls', () => {
+    // No external node may originate from the cancel helpers.
+    const ids = graph.nodes.map((n) => n.id);
+    expect(ids.some((id) => id.includes('checkIsCanceledError'))).toBe(false);
+    expect(ids.some((id) => id.includes('checkIsAxiosError'))).toBe(false);
+  });
+
+  it('labels an unresolved url with the url-arg source text (not a bare #unresolved)', () => {
+    const unresolved = graph.nodes.filter((n) => /#unresolved$/.test(n.id));
+    // the dynamic axios.get(buildPath(id)) call keeps its expression in the id
+    expect(unresolved.some((n) => n.id.includes('buildPath(id)'))).toBe(true);
+    // and it is never the bare, indistinguishable form
+    expect(unresolved.some((n) => n.id === 'ext:axios#unresolved')).toBe(false);
   });
 });
