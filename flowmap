@@ -15,8 +15,13 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI="$DIR/ts-analyzer/dist/cli.js"
 
-if [[ ! -f "$CLI" ]]; then
-  echo "flowmap: $CLI not found — building ts-analyzer first…" >&2
+# (Re)build when the compiled CLI is missing OR any TS source is newer than it, so edits
+# to ts-analyzer/src always take effect. Guarding ONLY on "$CLI" missing keeps running a
+# STALE dist after source fixes — the same trap as flowmap-spring's `[ -x "$BIN" ]` guard
+# (now `./gradlew installDist` every run). The `find … -newer … -quit` is a cheap stat-only
+# staleness check that stops at the first newer file; tsc then recompiles just what changed.
+if [[ ! -f "$CLI" ]] || [[ -n "$(find "$DIR/ts-analyzer/src" -name '*.ts' -newer "$CLI" -print -quit 2>/dev/null)" ]]; then
+  echo "flowmap: (re)building ts-analyzer (sources changed or dist missing)…" >&2
   npm --prefix "$DIR/ts-analyzer" run build >&2
 fi
 
