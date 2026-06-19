@@ -814,15 +814,24 @@ function cmdImpactRepos(opts: Opts): void {
   for (const grp of groups.values()) {
     const sorted = grp.graphs.slice().sort();
     const repr = sorted[0];
-    const out = repr.replace(/\.json$/, '.impact.json');
-    // A monorepo group: clear any stale per-sub-root impact on the non-representatives
-    // so the manifest links the repo's single impact only (no duplicates).
-    for (const g of sorted.slice(1)) pruneImpactArtifacts(g);
+    // 표준 정렬(spring/nexcore 와 동일): repo 단위 impact 를 git work tree 이름의 폴더에 둔다 —
+    //   <out-dir>/<repoName>/<base>.impact.json (+ <base>.impact/ 샤드). 이 폴더엔 graph 가 없으므로
+    //   manifest 가 "graph 없는 repo 엔트리"(repo===name)로 잡고, 모듈(sub-root) 그래프들은 repo=R 로 묶인다.
+    //   단일 sub-root 면 repoName 이 그 root 폴더명과 같아 기존처럼 graph 와 한 폴더에 놓인다(single-graph 변형).
+    const repoName = path.basename(grp.gitDir);
+    const base = path.basename(repr, '.json');
+    const repoDir = path.join(outDir, repoName);
+    const out = path.join(repoDir, `${base}.impact.json`);
+    // impact 가 repoDir 로 모이므로, 다른 sub-root 폴더의 (이전 실행) impact 산출물은 정리한다.
+    for (const g of sorted) {
+      if (path.resolve(path.dirname(g)) !== path.resolve(repoDir)) pruneImpactArtifacts(g);
+    }
     if (!gitSource.isRepo(grp.gitDir)) {
-      process.stderr.write(`  · ${path.basename(grp.gitDir)}: skip (not a git work tree)\n`);
+      process.stderr.write(`  · ${repoName}: skip (not a git work tree)\n`);
       continue;
     }
-    const label = sorted.length > 1 ? `${path.basename(grp.gitDir)} (${sorted.length} sub-roots)` : path.basename(path.dirname(repr));
+    fs.mkdirSync(repoDir, { recursive: true });
+    const label = sorted.length > 1 ? `${repoName} (${sorted.length} sub-roots)` : path.basename(path.dirname(repr));
     process.stderr.write(`      ${label} → ${out}\n`);
     const merged = sorted.length === 1 ? readGraphFile(sorted[0]) : mergeGraphs(sorted.map(readGraphFile));
     if (runImpact(merged, grp.gitDir, grp.prefix, out, { incremental, max, since, base: opts.flags['--base'] ?? null })) analyzed++;
