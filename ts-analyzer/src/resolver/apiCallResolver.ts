@@ -708,6 +708,16 @@ export class ApiCallResolver {
         return rest === '' ? '/' : rest.startsWith('/') ? rest : '/' + rest;
       }
     }
+    // Anonymous-placeholder host (`{}/pension/v1/...`): an unresolved base-URL/gateway
+    // import (e.g. `SEC_API_GW_URL` from an external `@scope/env` package) that const
+    // folding reduced to a bare `{}` instead of a named `${...}`. It still occupies the
+    // scheme+host position (no leading slash), so strip the leading `{}` — otherwise the
+    // join key keeps a spurious `/{}` host segment that matches no backend controller and
+    // no gateway public-prefix, leaving the call permanently `unmatched`.
+    if (url.startsWith('{}')) {
+      const rest = url.slice(2);
+      return rest === '' ? '/' : rest.startsWith('/') ? rest : '/' + rest;
+    }
     return url.startsWith('/') ? url : '/' + url;
   }
 
