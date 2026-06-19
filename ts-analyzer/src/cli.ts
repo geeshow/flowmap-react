@@ -781,9 +781,12 @@ function pruneImpactArtifacts(graphPath: string): void {
  * Repo-level PR change-impact over a per-service output dir: discover every service
  * graph, group them by their resolved git work tree (so a monorepo's sub-roots fall
  * in one group), and run impact ONCE per repo against the MERGED graph of the group.
- * The result is written to the group's representative sub-root (the first by path),
- * and the other sub-roots' stale impact artifacts are pruned — so each repo carries
- * a single, deduplicated impact spanning all its packages.
+ * The result is written to a folder named after the git work tree —
+ * `<out-dir>/<repoName>/<base>.impact.json` (+ `<base>.impact/` shards), aligned with
+ * spring/nexcore (a graph-less repo folder the manifest links as `repo===name`). The
+ * sub-roots' own stale impact artifacts are pruned — so each repo carries a single,
+ * deduplicated impact spanning all its packages. A single-root repo keeps its impact
+ * next to its graph (repoName == that root's folder), as the normal per-service variant.
  */
 function cmdImpactRepos(opts: Opts): void {
   const repoRoot = opts.flags['--repo-root'] ?? opts.flags['--repo'];

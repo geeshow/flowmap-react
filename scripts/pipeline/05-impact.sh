@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 4: PR change-impact, analyzed PER GIT REPO → <repr>/<BASE>.impact.json
+# Stage 4: PR change-impact, analyzed PER GIT REPO → <repoName>/<BASE>.impact.json
 # (+ <BASE>.impact/<n>.json shards). Mirrors flowmap-spring scripts/05-impact.sh.
 #
 # `impact-repos` discovers every service graph under OUT_DIR and groups them by the
@@ -7,8 +7,9 @@
 # to the nearest .git). Each repo is analyzed ONCE against the MERGED graph of its
 # sub-roots, so a MONOREPO's packages share a single, deduplicated impact spanning
 # all of them (a changed shared module reaches screens in any package). The result is
-# written to the repo group's representative sub-root; other sub-roots' stale impact
-# artifacts are pruned. A service with no git work tree at/above its checkout is skipped.
+# written to a folder named after the git work tree (<out-dir>/<repoName>/), so the web
+# manifest links it as a repo-level entry; sub-roots' stale impact artifacts are pruned.
+# A service with no git work tree at/above its checkout is skipped.
 #
 # Runs INCREMENTALLY by default (analyze only PRs merged since the last run, reusing
 # the existing impact.json + shards) — set IMPACT_FULL=1 to force a clean full rebuild.
