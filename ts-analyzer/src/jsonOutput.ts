@@ -101,10 +101,40 @@ export function writeManifest(outDir: string): string {
     })
     .filter((p): p is NonNullable<typeof p> => p != null);
 
+  // graph 없는 repo 단위 impact 엔트리 — 모노레포 sub-root 들을 한데 묶은 repo 폴더(<repo>/<base>.impact.json만
+  // 있고 graph.json 은 없음). spring/nexcore 의 impact-only 엔트리와 같은 역할(웹 commit/PR 뷰 전용).
+  const graphNames = new Set(projects.map((p) => p.name));
+  const impactOnly = services
+    .filter((service) => !graphNames.has(service))
+    .map((service) => {
+      const svcDir = path.join(outDir, service);
+      let impactFile: string | undefined;
+      try {
+        impactFile = fs.readdirSync(svcDir).find((f) => f.endsWith('.impact.json') && !f.startsWith('_'));
+      } catch {
+        return null;
+      }
+      if (!impactFile) return null;
+      return {
+        name: service,
+        type: 'frontend',
+        repo: service, // repo 단위 엔트리는 repo===name
+        graph: null,
+        openapi: null,
+        impact: `${service}/${impactFile}`,
+        join: null,
+        screens: null,
+        nodes: 0,
+        edges: 0,
+        generated: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      };
+    })
+    .filter((p): p is NonNullable<typeof p> => p != null);
+
   const manifest = {
     version: 1,
     generated: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-    projects,
+    projects: [...projects, ...impactOnly],
   };
   const text = JSON.stringify(manifest, null, 2);
   fs.writeFileSync(path.join(outDir, '_manifest.json'), text);
