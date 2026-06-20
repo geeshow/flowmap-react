@@ -40,5 +40,6 @@ echo "[3] join → ${#GRAPHS[@]} graph(s) against $BACKEND${AFFINITY:+ (affinity
 for g in "${GRAPHS[@]}"; do
   out="${g%.json}.join.json"
   echo "      $g → $out" >&2
-  "$FLOWMAP" join --graph "$g" --backend "$BACKEND" --out "$out" "${AFF_ARGS[@]}"
+  # ${arr[@]+"${arr[@]}"} expands safely under `set -u` even when AFF_ARGS is empty (bash 3.2).
+  "$FLOWMAP" join --graph "$g" --backend "$BACKEND" --out "$out" ${AFF_ARGS[@]+"${AFF_ARGS[@]}"}
 done

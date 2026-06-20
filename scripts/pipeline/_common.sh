@@ -54,17 +54,11 @@ case "$(echo "$NO_SPLIT" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes) COMMON_FLAGS+=(--no-split) ;;
 esac
 
-# List the front graphs to join: one `<OUT_DIR>/<service>/<base>.json` per
-# service subdirectory (derived .join/.screens/.openapi/.impact siblings live
-# alongside but are not graphs). Mirrors listGraphsToJoin. One path per line.
+# List the front graphs to join: one `<base>.json` per service leaf in the nested
+# layout `<OUT_DIR>/<ns>/<repo>/<per-root>/<base>.json` (derived
+# .join/.screens/.openapi/.impact siblings live alongside but are not graphs; the
+# `.impact`/`.pulls` shard dirs are pruned). Mirrors listGraphsToJoin. One path per line.
 join_graphs() {
-  local found=() f
-  shopt -s nullglob
-  for f in "$OUT_DIR"/*/"$BASE.json"; do
-    found+=("$f")
-  done
-  shopt -u nullglob
-  if [ ${#found[@]} -gt 0 ]; then
-    printf '%s\n' "${found[@]}" | sort
-  fi
+  find "$OUT_DIR" \( -name '*.impact' -o -name '*.pulls' \) -type d -prune -o \
+    -type f -name "$BASE.json" -print 2>/dev/null | sort
 }

@@ -40,18 +40,33 @@ const MANIFEST_SUFFIXES = ['.join.json', '.screens.json', '.openapi.json', '.imp
  * paths) are recorded relative to `outDir` as `<service>/<file>`.
  */
 export function writeManifest(outDir: string): string {
-  const services = fs
-    .readdirSync(outDir, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => e.name)
-    .sort();
+  // Nested layout: leaf project dirs live at `<outDir>/<ns>/<repo>/<perRoot>/`. Recurse to the
+  // dirs directly holding a `.json` artifact (skipping `.impact`/`.pulls` shard dirs).
+  const leaves: string[] = [];
+  const walk = (d: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((e) => e.isFile() && e.name.endsWith('.json') && !e.name.startsWith('_'))) leaves.push(d);
+    for (const e of entries) {
+      if (e.isDirectory() && !e.name.endsWith('.impact') && !e.name.endsWith('.pulls')) walk(path.join(d, e.name));
+    }
+  };
+  walk(outDir);
+  leaves.sort();
 
   // Frontend-only node layers — their presence marks a graph as a frontend graph.
   const FRONTEND_LAYERS = new Set(['SCREEN', 'HOOK', 'STORE', 'API']);
+  // `<ns>/<repo>` path segments for a leaf dir (for graph-less entries with no meta to read).
+  const segOf = (svcDir: string) => path.relative(outDir, svcDir).split(path.sep);
 
-  const projects = services
-    .map((service) => {
-      const svcDir = path.join(outDir, service);
+  const projects = leaves
+    .map((svcDir) => {
+      const service = path.basename(svcDir); // perRoot (leaf dir name)
+      const rel = path.relative(outDir, svcDir).split(path.sep).join('/');
       // The one pure graph in a service dir: a `.json` that is neither a derived
       // sibling (.join/.screens/.openapi/.impact) nor an internal `_` file.
       const graphFile = fs
@@ -62,12 +77,13 @@ export function writeManifest(outDir: string): string {
 
       const base = graphFile.slice(0, -'.json'.length);
       const sibling = (suffix: string) =>
-        fs.existsSync(path.join(svcDir, `${base}.${suffix}`)) ? `${service}/${base}.${suffix}` : null;
+        fs.existsSync(path.join(svcDir, `${base}.${suffix}`)) ? `${rel}/${base}.${suffix}` : null;
 
       let nodes = 0;
       let edges = 0;
       let isFrontend = false;
       let repo: string | null = null;
+      let namespace: string | null = null;
       let generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
       try {
         const root = JSON.parse(fs.readFileSync(path.join(svcDir, graphFile), 'utf8'));
@@ -76,8 +92,9 @@ export function writeManifest(outDir: string): string {
         // Detect type from node layers so a shared dir holding BOTH backend and
         // frontend graphs is catalogued correctly no matter which tool wrote last.
         isFrontend = Array.isArray(root.nodes) && root.nodes.some((n: { layer?: string }) => n.layer != null && FRONTEND_LAYERS.has(n.layer));
-        // git work tree this service belongs to (the frontend analyzer stamps it):
+        // git namespace/repo this service belongs to (the analyzer stamps them):
         // monorepo sub-roots share one `repo`, so repo-level views can group them.
+        namespace = str(root.meta, 'gitNamespace');
         repo = str(root.meta, 'gitRepo');
         const g = str(root.meta, 'generated');
         if (g) generated = g;
@@ -88,8 +105,9 @@ export function writeManifest(outDir: string): string {
       return {
         name: service,
         type: isFrontend ? 'frontend' : 'backend',
+        namespace,
         repo,
-        graph: `${service}/${graphFile}`,
+        graph: `${rel}/${graphFile}`,
         openapi: sibling('openapi.json'),
         impact: sibling('impact.json'),
         join: sibling('join.json'),
@@ -101,13 +119,14 @@ export function writeManifest(outDir: string): string {
     })
     .filter((p): p is NonNullable<typeof p> => p != null);
 
-  // graph 없는 repo 단위 impact 엔트리 — 모노레포 sub-root 들을 한데 묶은 repo 폴더(<repo>/<base>.impact.json만
-  // 있고 graph.json 은 없음). spring/nexcore 의 impact-only 엔트리와 같은 역할(웹 commit/PR 뷰 전용).
-  const graphNames = new Set(projects.map((p) => p.name));
-  const impactOnly = services
-    .filter((service) => !graphNames.has(service))
-    .map((service) => {
-      const svcDir = path.join(outDir, service);
+  // graph 없는 repo 단위 impact 엔트리 — 모노레포 sub-root 들을 한데 묶은 repo 폴더
+  // (<ns>/<repo>/<repo>/<base>.impact.json 만 있고 graph.json 은 없음). namespace/repo 는 경로에서 도출.
+  const graphDirs = new Set(projects.map((p) => p.graph.split('/').slice(0, -1).join('/')));
+  const impactOnly = leaves
+    .filter((svcDir) => !graphDirs.has(path.relative(outDir, svcDir).split(path.sep).join('/')))
+    .map((svcDir) => {
+      const service = path.basename(svcDir);
+      const rel = path.relative(outDir, svcDir).split(path.sep).join('/');
       let impactFile: string | undefined;
       try {
         impactFile = fs.readdirSync(svcDir).find((f) => f.endsWith('.impact.json') && !f.startsWith('_'));
@@ -115,13 +134,15 @@ export function writeManifest(outDir: string): string {
         return null;
       }
       if (!impactFile) return null;
+      const seg = segOf(svcDir);
       return {
         name: service,
         type: 'frontend',
-        repo: service, // repo 단위 엔트리는 repo===name
+        namespace: seg.length >= 3 ? seg[seg.length - 3] : null,
+        repo: seg.length >= 2 ? seg[seg.length - 2] : service,
         graph: null,
         openapi: null,
-        impact: `${service}/${impactFile}`,
+        impact: `${rel}/${impactFile}`,
         join: null,
         screens: null,
         nodes: 0,

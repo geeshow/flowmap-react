@@ -146,6 +146,25 @@ export function toWebBase(remote: string): string | null {
   return u || null;
 }
 
+/**
+ * Parse a git remote URL into its `{ namespace, repo }` (owner + repo) — the last two
+ * path segments of the normalized web base, e.g. `git@github.com:geeshow/flowmap-react.git`
+ * → `{ namespace: 'geeshow', repo: 'flowmap-react' }`. Null when it can't be normalized.
+ */
+export function parseNamespaceRepo(remote: string): { namespace: string; repo: string } | null {
+  const web = toWebBase(remote);
+  if (!web) return null;
+  const segs = web.replace(/^https:\/\//, '').split('/').filter(Boolean);
+  if (segs.length < 3) return null; // [host, owner..., repo]
+  return { namespace: segs[segs.length - 2], repo: segs[segs.length - 1] };
+}
+
+/** `{ namespace, repo }` for the git work tree at [gitDir] from its `origin` remote, or null. */
+export function namespaceRepo(gitDir: string): { namespace: string; repo: string } | null {
+  const u = remoteUrl(gitDir);
+  return u ? parseNamespaceRepo(u) : null;
+}
+
 // ---- PR discovery ----
 
 const MERGE_PR = /^Merge pull request #(\d+) /;
