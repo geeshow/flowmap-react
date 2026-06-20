@@ -139,4 +139,73 @@ describe('join', () => {
     const r = join(front, aliasBackend());
     expect(r.meta.unmatched).toBe(1);
   });
+
+  // ---- affinity hint: break a same-path tie by fe-svc ↔ backend-project ----
+
+  it('breaks an ambiguous direct tie with an affinity hint (counts as matched/direct)', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'POST', endpoint: '/orders' })], edges: [] };
+    const r = join(front, backend(), {
+      frontendService: 'services-order',
+      affinity: new Map([['services-order', ['order*']]]),
+    });
+    expect(r.meta.matched).toBe(1);
+    expect(r.meta.ambiguous).toBe(0);
+    expect(r.meta.viaAffinity).toBe(1);
+    expect(r.links[0].via).toBe('direct');
+    expect(r.links[0].backendProject).toBe('order-service');
+    expect(r.links[0].candidates.sort()).toEqual(['order#create', 'shop#place']); // tie recorded
+  });
+
+  it('matches the fe-svc against a glob affinity key', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'POST', endpoint: '/orders' })], edges: [] };
+    const r = join(front, backend(), {
+      frontendService: 'shop-web-react',
+      affinity: new Map([['shop-*', ['sample-shop']]]),
+    });
+    expect(r.meta.matched).toBe(1);
+    expect(r.links[0].backendProject).toBe('sample-shop');
+  });
+
+  it('leaves the tie ambiguous when affinity narrows to zero or multiple projects', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'POST', endpoint: '/orders' })], edges: [] };
+    // pattern matches BOTH order-service and sample-shop's... no — matches neither here
+    const r = join(front, backend(), {
+      frontendService: 'services-order',
+      affinity: new Map([['services-order', ['nonexistent*']]]),
+    });
+    expect(r.meta.ambiguous).toBe(1);
+    expect(r.meta.viaAffinity).toBe(0);
+  });
+
+  it('is a no-op when no affinity is configured', () => {
+    const front: CallGraph = { nodes: [frontApi({ httpMethod: 'POST', endpoint: '/orders' })], edges: [] };
+    const r = join(front, backend());
+    expect(r.meta.ambiguous).toBe(1);
+    expect(r.meta.viaAffinity).toBe(0);
+  });
+
+  // ---- internal route: a Next.js route handler is not a backend call (not false-external) ----
+
+  it('classifies a Next.js route handler as internal, not unmatched', () => {
+    const front: CallGraph = {
+      nodes: [
+        makeNode({
+          id: 'ext:GET /api/profile',
+          fqcn: 'app/api/profile/route.ts',
+          method: 'get',
+          layer: 'API',
+          httpMethod: 'GET',
+          endpoint: '/api/profile',
+          description: 'next-route-handler',
+        }),
+      ],
+      edges: [],
+    };
+    const r = join(front, backend());
+    expect(r.meta.internal).toBe(1);
+    expect(r.meta.unmatched).toBe(0);
+    expect(r.links[0].matchStatus).toBe('internal');
+    expect(r.links[0].via).toBe('internal');
+    expect(r.links[0].backendNodeId).toBeNull();
+  });
 });

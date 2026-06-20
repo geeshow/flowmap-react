@@ -51,3 +51,31 @@ describe('EnvResolver.loadEnvCmdrc', () => {
     expect(env.lookup('viteAppApiGw')).toBe('https://sandbox-app-api-gw.kakaopaysec.com');
   });
 });
+
+describe('EnvResolver variable expansion (dotenv-expand)', () => {
+  it('inlines ${VAR} / $VAR references to other loaded vars', () => {
+    const env = new EnvResolver({ VITE_BASE: 'https://api.example.com', VITE_API_URL: '${VITE_BASE}/api', VITE_WS: '$VITE_BASE/ws' });
+    expect(env.lookup('VITE_API_URL')).toBe('https://api.example.com/api');
+    expect(env.lookup('VITE_WS')).toBe('https://api.example.com/ws');
+  });
+
+  it('resolves chained references', () => {
+    const env = new EnvResolver({ HOST: 'https://x.com', BASE: '${HOST}/v1', FULL: '${BASE}/orders' });
+    expect(env.lookup('FULL')).toBe('https://x.com/v1/orders');
+  });
+
+  it('keeps an unknown reference as a canonical ${NAME} placeholder', () => {
+    const env = new EnvResolver({ VITE_API_URL: '${UNKNOWN_GW}/api' });
+    expect(env.lookup('VITE_API_URL')).toBe('${UNKNOWN_GW}/api');
+  });
+
+  it('does not loop on a cyclic reference', () => {
+    const env = new EnvResolver({ A: '${B}', B: '${A}' });
+    expect(env.lookup('A')).toBe('${A}'); // A→B→A: the back-reference is left untouched
+  });
+
+  it('leaves plain values (no $) untouched', () => {
+    const env = new EnvResolver({ URL: 'https://plain.example.com/api' });
+    expect(env.lookup('URL')).toBe('https://plain.example.com/api');
+  });
+});

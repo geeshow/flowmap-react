@@ -12,7 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { bfs, Direction, findNodes } from './bfs';
 import { GraphBuilder } from './graphBuilder';
-import { join as joinGraphs } from './join';
+import { join as joinGraphs, Affinity } from './join';
 import * as jsonOutput from './jsonOutput';
 import { CallGraph, CallEdge, MethodNode } from './model';
 import { checkGraph, formatHealth } from './doctor';
@@ -155,6 +155,37 @@ function cmdIr(opts: Opts): void {
   const out = opts.flags['--out'];
   if (out) fs.writeFileSync(out, JSON.stringify(files));
   else process.stdout.write(JSON.stringify(files));
+}
+
+/**
+ * Load a fe-svc → backend-project affinity map from a JSON file. Accepts either a
+ * bare object (`{ "fe-svc": ["be-proj*"] }`) or one nested under an `affinity` key
+ * (so a single `flowmap.affinity.json` can carry other settings too). A string
+ * value is treated as a one-element list. Missing/unreadable file → empty map (no-op).
+ */
+function loadAffinity(file?: string): Affinity {
+  const m = new Map<string, string[]>();
+  if (!file || !fs.existsSync(file)) return m;
+  try {
+    const root = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const obj = root && typeof root.affinity === 'object' && root.affinity ? root.affinity : root;
+    for (const [k, v] of Object.entries(obj ?? {})) {
+      if (Array.isArray(v)) m.set(k, v.map(String));
+      else if (typeof v === 'string') m.set(k, [v]);
+    }
+  } catch (e) {
+    process.stderr.write(`join: ignoring unreadable --affinity ${file}: ${(e as Error).message}\n`);
+  }
+  return m;
+}
+
+/** The service name a frontend graph records in `meta.project` — the affinity key. */
+function readGraphMetaProject(graphPath: string): string | null {
+  try {
+    return JSON.parse(fs.readFileSync(graphPath, 'utf8')).meta?.project ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function readGraphFile(p: string): CallGraph {
@@ -335,7 +366,9 @@ function cmdJoin(opts: Opts): void {
   }
   const frontend = jsonOutput.read(fs.readFileSync(graphPath, 'utf8'));
   const backend = mergeGraphs(backends.map((p) => jsonOutput.read(fs.readFileSync(p, 'utf8'))));
-  const result = joinGraphs(frontend, backend);
+  const affinity = loadAffinity(opts.flags['--affinity']);
+  const frontendService = readGraphMetaProject(graphPath);
+  const result = joinGraphs(frontend, backend, { affinity, frontendService });
   const doc = {
     meta: {
       command: 'join',
@@ -349,7 +382,9 @@ function cmdJoin(opts: Opts): void {
   if (opts.flags['--out']) {
     fs.writeFileSync(opts.flags['--out'], text);
     process.stderr.write(
-      `wrote ${opts.flags['--out']}: ${result.meta.matched} matched (${result.meta.viaGateway} via gateway), ${result.meta.unmatched} unmatched, ${result.meta.ambiguous} ambiguous\n`,
+      `wrote ${opts.flags['--out']}: ${result.meta.matched} matched ` +
+        `(${result.meta.viaGateway} via gateway, ${result.meta.viaAffinity} via affinity), ` +
+        `${result.meta.unmatched} unmatched, ${result.meta.ambiguous} ambiguous, ${result.meta.internal} internal\n`,
     );
     // The join output is a sibling of the graph inside the service dir; the
     // catalogue sits one level up at OUT_DIR. refreshManifest takes dirname, so
@@ -410,6 +445,7 @@ async function cmdPipeline(opts: Opts): Promise<void> {
   const project = pick('--project', 'PROJECT') || null;
   const outDir = pick('--out-dir', 'OUT_DIR', '.');
   const backend = pick('--backend', 'BACKEND');
+  const affinity = pick('--affinity', 'AFFINITY');
   const mode = pick('--mode', 'MODE');
   const envFile = pick('--env', 'ENV');
   const envProfile = pick('--env-profile', 'ENV_PROFILE');
@@ -489,7 +525,9 @@ async function cmdPipeline(opts: Opts): Promise<void> {
     process.stderr.write(`\n[3/3] join → ${graphs.length} graph(s)\n`);
     for (const g of graphs) {
       const joinOut = g.replace(/\.json$/, '.join.json');
-      cmdJoin({ flags: { '--graph': g, '--backend': backend, '--out': joinOut } });
+      const joinFlags: Record<string, string> = { '--graph': g, '--backend': backend, '--out': joinOut };
+      if (affinity) joinFlags['--affinity'] = affinity;
+      cmdJoin({ flags: joinFlags });
     }
   }
   process.stderr.write(`\ndone.\n`);
@@ -859,7 +897,8 @@ function usage(): void {
       '          # --only join: re-run just join against the existing per-root graphs (no re-analyze)',
       '  analyze --repo <dir> [--project P] [--out f.json] [--env kv.txt] [--env-profile name] [--mode development|production]',
       '          [--workers N] [--no-split]   # large repos: split per project root into child processes',
-      '  join    --graph front.json --backend backend.json [--out join.json]',
+      '  join    --graph front.json --backend backend.json [--out join.json] [--affinity aff.json]',
+      '          # --affinity: fe-svc→backend-project hints {"fe-svc":["be-proj*"]} to break ambiguous (same-path) ties',
       '  search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]',
       '  stats   [--graph g.json | --repo <dir>]',
       '  doctor  [--graph g.json | --repo <dir>] [--max-orphans N]   # graph health: orphans, dangling, connectivity',

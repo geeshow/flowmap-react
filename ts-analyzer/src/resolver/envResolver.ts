@@ -26,9 +26,33 @@ export class EnvResolver {
     this.map.set(EnvResolver.canonical(key), value);
   }
 
-  /** Resolve a bare env var name to its value, or null if unknown. */
+  /**
+   * Resolve a bare env var name to its value, or null if unknown. The stored value
+   * is expanded: `$OTHER` / `${OTHER}` references to OTHER loaded vars are inlined
+   * (dotenv-expand semantics), so a chained base URL like
+   * `VITE_API_URL=${VITE_BASE}/api` resolves to a full path instead of leaking the
+   * literal `${VITE_BASE}` placeholder (a common cause of unresolved/false-external
+   * endpoints). Unknown references stay as a canonical `${NAME}` placeholder.
+   */
   lookup(name: string): string | null {
-    return this.map.get(EnvResolver.canonical(name)) ?? null;
+    const key = EnvResolver.canonical(name);
+    const raw = this.map.get(key);
+    if (raw == null) return null;
+    return this.expandRefs(raw, new Set([key]));
+  }
+
+  /** Inline `$VAR` / `${VAR}` references against other loaded vars (recursively).
+   *  Unknown refs → `${VAR}` (downstream marks the value partial); cycles are left as-is. */
+  private expandRefs(value: string, seen: Set<string>): string {
+    if (!value.includes('$')) return value;
+    return value.replace(/\$\{\s*([A-Za-z_]\w*)\s*\}|\$([A-Za-z_]\w*)/g, (m, braced, bare) => {
+      const ref = (braced ?? bare) as string;
+      const key = EnvResolver.canonical(ref);
+      if (seen.has(key)) return m; // cyclic reference — leave untouched
+      const sub = this.map.get(key);
+      if (sub == null) return '${' + ref + '}'; // unknown — keep a canonical placeholder
+      return this.expandRefs(sub, new Set([...seen, key]));
+    });
   }
 
   /** Load .env / .env.<mode> / .env.local from a project root (later wins). */

@@ -37,8 +37,11 @@ export interface JoinLink {
   confidence: Confidence | null;
   backendNodeId: string | null;
   backendProject: string | null;
-  matchStatus: 'matched' | 'unmatched' | 'ambiguous';
-  via: 'direct' | 'alias' | 'gateway' | null; // how it matched (null when unmatched)
+  // `internal` — the call targets an in-repo frontend route (a Next.js route
+  // handler), not a backend, so it is NOT a "false external" even though it never
+  // joins to the backend graph.
+  matchStatus: 'matched' | 'unmatched' | 'ambiguous' | 'internal';
+  via: 'direct' | 'alias' | 'gateway' | 'internal' | null; // how it matched (null when unmatched)
   candidates: string[];
 }
 
@@ -47,10 +50,56 @@ export interface JoinResult {
     matched: number;
     unmatched: number;
     ambiguous: number;
+    internal: number; // calls to in-repo frontend routes (Next.js handlers) — not backend, not external
     viaGateway: number; // of the matched/ambiguous links, how many resolved through a gateway
     viaAlias: number; // ...how many resolved through a backend alias (segment probe)
+    viaAffinity: number; // ...how many ambiguous ties an affinity hint broke (fe-svc ↔ backend-project)
   };
   links: JoinLink[];
+}
+
+/**
+ * fe-svc → backend-project affinity hint. Keys are frontend-service globs
+ * (matched against the joined graph's service name); values are backend-project
+ * globs. When a call's REST path is served by MORE THAN ONE backend project (the
+ * commonest cause of a false "ambiguous" → external), the candidates are narrowed
+ * to the project(s) the frontend service is known to talk to. If exactly one
+ * survives, the tie is broken and the call counts as `matched` instead of
+ * `ambiguous`. A no-op (empty map) leaves every existing join unchanged.
+ */
+export type Affinity = Map<string, string[]>;
+
+export interface JoinOptions {
+  affinity?: Affinity;
+  /** The joined frontend graph's service name (graph meta.project), for affinity matching. */
+  frontendService?: string | null;
+}
+
+/** Glob match: `*` = any run of chars, full-string, case-insensitive. */
+function globMatch(value: string | null, pattern: string): boolean {
+  if (value == null) return false;
+  const re = new RegExp('^' + pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'i');
+  return re.test(value);
+}
+
+/** Backend-project globs configured for [fesvc] — the union over every matching fe-svc key. */
+function affinityPatternsFor(fesvc: string | null, aff: Affinity): string[] {
+  if (!fesvc || aff.size === 0) return [];
+  const out: string[] = [];
+  for (const [key, pats] of aff) if (globMatch(fesvc, key)) out.push(...pats);
+  return out;
+}
+
+/**
+ * Narrow tied backend candidates to those whose project matches the fe-svc's
+ * affinity patterns. Returns the lone survivor, or null when 0 / 2+ survive (no
+ * confident pick — leave the call ambiguous).
+ */
+function pickByAffinity(fesvc: string | null, candidates: MethodNode[], aff: Affinity): MethodNode | null {
+  const pats = affinityPatternsFor(fesvc, aff);
+  if (!pats.length) return null;
+  const picked = candidates.filter((c) => pats.some((p) => globMatch(c.project, p)));
+  return picked.length === 1 ? picked[0] : null;
 }
 
 /**
@@ -118,7 +167,10 @@ function projectMatchesHint(project: string | null, tokens: string[]): boolean {
   return tokens.some((t) => t === p || t.includes(p) || p.includes(t));
 }
 
-export function join(frontend: CallGraph, backend: CallGraph): JoinResult {
+export function join(frontend: CallGraph, backend: CallGraph, opts: JoinOptions = {}): JoinResult {
+  const affinity = opts.affinity ?? new Map<string, string[]>();
+  const fesvc = opts.frontendService ?? null;
+  let viaAffinity = 0; // ambiguous ties broken by an affinity hint (any tier)
   // index backend controller endpoints + gateway route nodes
   const providers = backend.nodes.filter((n) => n.layer === 'CONTROLLER' && n.endpoint && n.endpoint.length > 0);
   const gateways = backend.nodes.filter((n) => n.layer === 'GATEWAY' && n.endpoint && n.endpoint.length > 0);
@@ -137,9 +189,22 @@ export function join(frontend: CallGraph, backend: CallGraph): JoinResult {
   const links: JoinLink[] = [];
   const apiNodes = frontend.nodes.filter((n) => (n.layer === 'API' || n.layer === 'EXTERNAL') && n.endpoint);
 
+  // Internal-route set: in-repo provider endpoints (Next.js route handlers, Express/
+  // Vite in-repo routers). A call to one of these is internal (frontend→handler), not
+  // a backend call. The provider node itself carries the marker; a consumer node that
+  // did NOT merge with it (e.g. a GET call vs an ANY `use` handler) is caught by its
+  // (normPath, verb) matching the set — so neither is mislabelled a false external.
+  const internalRoutes = apiNodes
+    .filter((n) => n.description === 'next-route-handler' || n.description === 'express-route-handler')
+    .map((n) => ({ np: normPath(n.endpoint), method: n.httpMethod }));
+  const isInternalCall = (fn: MethodNode): boolean => {
+    if (fn.description === 'next-route-handler' || fn.description === 'express-route-handler') return true;
+    const np = normPath(fn.endpoint);
+    return internalRoutes.some((r) => r.np === np && verbOk(r.method, fn.httpMethod));
+  };
+
   for (const fn of apiNodes) {
     const np = normPath(fn.endpoint);
-    const matches = providers.filter((p) => normPath(p.endpoint) === np && verbOk(p.httpMethod, fn.httpMethod));
 
     let backendNodeId: string | null = null;
     let backendProject: string | null = null;
@@ -147,39 +212,61 @@ export function join(frontend: CallGraph, backend: CallGraph): JoinResult {
     let via: JoinLink['via'] = null;
     let candidates: string[] = [];
 
-    if (matches.length === 1) {
-      // 1) direct controller match
-      backendNodeId = matches[0].id;
-      backendProject = matches[0].project;
-      status = 'matched';
-      via = 'direct';
-    } else if (matches.length > 1) {
-      const hints = hintTokens(fn);
-      const preferred = matches.find((p) => projectMatchesHint(p.project, hints));
-      const chosen = preferred ?? matches[0];
-      backendNodeId = chosen.id;
-      backendProject = chosen.project;
-      status = preferred ? 'matched' : 'ambiguous';
-      via = 'direct';
-      candidates = matches.map((p) => p.id);
+    // 0) in-repo frontend route (a Next.js route handler, or an Express/Vite in-repo
+    //    router) — the call's own provider lives in this graph, not the backend. It can
+    //    never match a backend node, so counting it as `unmatched` mislabels an internal
+    //    route as a false external. Classify it `internal` and skip the backend tiers.
+    if (isInternalCall(fn)) {
+      status = 'internal';
+      via = 'internal';
     } else {
-      // 2) alias probe — opaque-token endpoints (e.g. nexcore `.jmd` transaction id)
-      const al = matchAlias(aliasIndex, np, fn.httpMethod);
-      if (al.chosen) {
-        backendNodeId = al.chosen.id;
-        backendProject = al.chosen.project;
-        via = 'alias';
-        status = al.tied.length > 0 ? 'ambiguous' : 'matched';
-        candidates = al.tied.map((n) => n.id);
+      const matches = providers.filter((p) => normPath(p.endpoint) === np && verbOk(p.httpMethod, fn.httpMethod));
+
+      if (matches.length === 1) {
+        // 1) direct controller match
+        backendNodeId = matches[0].id;
+        backendProject = matches[0].project;
+        status = 'matched';
+        via = 'direct';
+      } else if (matches.length > 1) {
+        // Tie: prefer a host/${} token hint, then a fe-svc↔backend-project affinity hint.
+        const hints = hintTokens(fn);
+        let preferred = matches.find((p) => projectMatchesHint(p.project, hints));
+        if (!preferred) {
+          const picked = pickByAffinity(fesvc, matches, affinity);
+          if (picked) { preferred = picked; viaAffinity++; }
+        }
+        const chosen = preferred ?? matches[0];
+        backendNodeId = chosen.id;
+        backendProject = chosen.project;
+        status = preferred ? 'matched' : 'ambiguous';
+        via = 'direct';
+        candidates = matches.map((p) => p.id);
       } else {
-        // 3) gateway fallback — public path the gateway rewrites before the backend
-        const gw = matchGateway(gateways, np, fn.httpMethod);
-        if (gw.chosen) {
-          backendNodeId = gw.chosen.id;
-          backendProject = gw.chosen.project;
-          via = 'gateway';
-          status = gw.tied.length > 0 ? 'ambiguous' : 'matched';
-          candidates = gw.tied.map((g) => g.id);
+        // 2) alias probe — opaque-token endpoints (e.g. nexcore `.jmd` transaction id)
+        const al = matchAlias(aliasIndex, np, fn.httpMethod);
+        if (al.chosen) {
+          via = 'alias';
+          candidates = al.tied.map((n) => n.id);
+          const picked = al.tied.length > 0 ? pickByAffinity(fesvc, al.tied, affinity) : null;
+          const chosen = picked ?? al.chosen;
+          if (picked) viaAffinity++;
+          backendNodeId = chosen.id;
+          backendProject = chosen.project;
+          status = al.tied.length > 0 && !picked ? 'ambiguous' : 'matched';
+        } else {
+          // 3) gateway fallback — public path the gateway rewrites before the backend
+          const gw = matchGateway(gateways, np, fn.httpMethod);
+          if (gw.chosen) {
+            via = 'gateway';
+            candidates = gw.tied.map((g) => g.id);
+            const picked = gw.tied.length > 0 ? pickByAffinity(fesvc, gw.tied, affinity) : null;
+            const chosen = picked ?? gw.chosen;
+            if (picked) viaAffinity++;
+            backendNodeId = chosen.id;
+            backendProject = chosen.project;
+            status = gw.tied.length > 0 && !picked ? 'ambiguous' : 'matched';
+          }
         }
       }
     }
@@ -203,8 +290,10 @@ export function join(frontend: CallGraph, backend: CallGraph): JoinResult {
       matched: links.filter((l) => l.matchStatus === 'matched').length,
       unmatched: links.filter((l) => l.matchStatus === 'unmatched').length,
       ambiguous: links.filter((l) => l.matchStatus === 'ambiguous').length,
+      internal: links.filter((l) => l.matchStatus === 'internal').length,
       viaGateway: links.filter((l) => l.via === 'gateway' && l.matchStatus !== 'unmatched').length,
       viaAlias: links.filter((l) => l.via === 'alias' && l.matchStatus !== 'unmatched').length,
+      viaAffinity,
     },
     links,
   };
