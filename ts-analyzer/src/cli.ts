@@ -100,6 +100,36 @@ function serviceName(repoRoot: string, root: string, project?: string | null): s
 }
 
 /**
+ * Output provenance for a service root → `{ namespace, repo, perRoot }`, driving the nested
+ * layout `<out-dir>/<namespace>/<repo>/<perRoot>/`. Mirrors the spring/nexcore rule:
+ *  - the service is its OWN cloned repo under `.repo` (its git root lives under repoRootAbs) →
+ *    `(owner, repoName)` from its origin remote (falling back to the git-dir basename);
+ *  - otherwise (a demo bundled inside the analyzer's own repo — its git root walks up past
+ *    `.repo`) → namespace `"samples"`, repo = the root's basename.
+ * perRoot is the flattened service id ([serviceName]).
+ */
+function serviceProvenance(
+  repoRootAbs: string,
+  root: string,
+  perRoot: string,
+): { namespace: string; repo: string; perRoot: string } {
+  const target = gitSource.resolveGitTarget(repoRootAbs, root);
+  const gitDir = target ? path.resolve(target.gitDir) : null;
+  if (gitDir && gitDir.startsWith(repoRootAbs + path.sep)) {
+    const nr = gitSource.namespaceRepo(gitDir);
+    if (nr) return { ...nr, perRoot };
+    const b = path.basename(gitDir);
+    return { namespace: b, repo: b, perRoot };
+  }
+  return { namespace: 'samples', repo: path.basename(path.resolve(repoRootAbs, root)), perRoot };
+}
+
+/** Nested per-service dir under the output `projects` root: `<dir>/<namespace>/<repo>/<perRoot>/`. */
+function serviceDirOf(dir: string, prov: { namespace: string; repo: string; perRoot: string }): string {
+  return path.join(dir, prov.namespace, prov.repo, prov.perRoot);
+}
+
+/**
  * Analyze the repo into BOTH a combined graph and one self-contained graph per
  * project root (each root is treated as a distinct "service"). Per-root grouping
  * is preserved (workers return per-root IR), so a monorepo app's cross-package
@@ -246,17 +276,22 @@ function dump(graph: CallGraph, out: string | undefined, meta: Record<string, un
  * Returns one `<dir>/<service>/<base>.json` path per service.
  */
 function listGraphsToJoin(dir: string, base: string): string[] {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
+  const out: string[] = [];
+  function rec(d: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const g = path.join(d, `${base}.json`);
+    if (fs.existsSync(g)) out.push(g);
+    for (const e of entries) {
+      if (e.isDirectory() && !e.name.endsWith('.impact') && !e.name.endsWith('.pulls')) rec(path.join(d, e.name));
+    }
   }
-  return entries
-    .filter((e) => e.isDirectory())
-    .map((e) => path.join(dir, e.name, `${base}.json`))
-    .filter((g) => fs.existsSync(g))
-    .sort();
+  rec(dir);
+  return out.sort();
 }
 
 /** Rescan the output directory of `out` and (re)write `_manifest.json`. */
@@ -286,18 +321,18 @@ async function cmdAnalyze(opts: Opts): Promise<void> {
     const base = path.basename(out, '.json');
     const repoRootAbs = path.resolve(repo);
     for (const s of services) {
-      const svcDir = path.join(dir, s.name);
+      // namespace/repo from the service's git origin (or "samples" for a bundled demo);
+      // drives both the nested output dir and the manifest grouping (deploy/PR-impact).
+      const prov = serviceProvenance(repoRootAbs, s.root, s.name);
+      const svcDir = serviceDirOf(dir, prov);
       fs.mkdirSync(svcDir, { recursive: true });
-      // The git work tree this service belongs to (its monorepo, or itself). Lets
-      // the manifest group sibling sub-roots under one repo so repo-level views
-      // (deploy → service mapping, PR impact) aren't fooled by the flattened name.
-      const gitRepo = path.basename(gitSource.resolveGitTarget(repoRootAbs, s.root)?.gitDir ?? '') || null;
       dump(s.graph, path.join(svcDir, `${base}.json`), {
         command: 'analyze',
         repo,
         project: s.name,
         root: s.root,
-        gitRepo,
+        gitNamespace: prov.namespace,
+        gitRepo: prov.repo,
         files: s.fileCount,
         nodes: s.graph.nodes.length,
         edges: s.graph.edges.length,
@@ -579,7 +614,8 @@ function cmdScreens(opts: Opts): void {
     const dir = path.dirname(out) || '.';
     const stem = path.basename(out).replace(/\.screens\.json$/, '').replace(/\.json$/, '');
     for (const root of roots) {
-      const svcDir = path.join(dir, serviceName(repoRoot, root, project));
+      const prov = serviceProvenance(repoRoot, root, serviceName(repoRoot, root, project));
+      const svcDir = serviceDirOf(dir, prov);
       fs.mkdirSync(svcDir, { recursive: true });
       const doc = buildScreens({ repoRoot: repo, roots: [root] });
       const outPath = path.join(svcDir, `${stem}.screens.json`);
@@ -780,22 +816,24 @@ function cmdImpact(opts: Opts): void {
   if (!ok) process.exit(1);
 }
 
-/** Per-service graph files under a per-service-dir output root (`<out-dir>/<svc>/<base>.json`). */
+/** Per-service graph files under the nested output root (`<out-dir>/<ns>/<repo>/<perRoot>/<base>.json`). */
 function discoverServiceGraphs(outDir: string): string[] {
   const derived = /\.(join|screens|openapi|impact)\.json$/;
-  let subs: fs.Dirent[];
-  try {
-    subs = fs.readdirSync(outDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
   const graphs: string[] = [];
-  for (const d of subs) {
-    if (!d.isDirectory()) continue;
-    const svcDir = path.join(outDir, d.name);
-    const g = fs.readdirSync(svcDir).find((f) => f.endsWith('.json') && !f.startsWith('_') && !derived.test(f));
-    if (g) graphs.push(path.join(svcDir, g));
+  function rec(d: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const g = entries.find((e) => e.isFile() && e.name.endsWith('.json') && !e.name.startsWith('_') && !derived.test(e.name));
+    if (g) graphs.push(path.join(d, g.name));
+    for (const e of entries) {
+      if (e.isDirectory() && !e.name.endsWith('.impact') && !e.name.endsWith('.pulls')) rec(path.join(d, e.name));
+    }
   }
+  rec(outDir);
   return graphs.sort();
 }
 
@@ -817,14 +855,12 @@ function pruneImpactArtifacts(graphPath: string): void {
 
 /**
  * Repo-level PR change-impact over a per-service output dir: discover every service
- * graph, group them by their resolved git work tree (so a monorepo's sub-roots fall
- * in one group), and run impact ONCE per repo against the MERGED graph of the group.
- * The result is written to a folder named after the git work tree —
- * `<out-dir>/<repoName>/<base>.impact.json` (+ `<base>.impact/` shards), aligned with
- * spring/nexcore (a graph-less repo folder the manifest links as `repo===name`). The
- * sub-roots' own stale impact artifacts are pruned — so each repo carries a single,
- * deduplicated impact spanning all its packages. A single-root repo keeps its impact
- * next to its graph (repoName == that root's folder), as the normal per-service variant.
+ * graph, group them by their (namespace, repo) — the nested layout's `<ns>/<repo>` (so a
+ * monorepo's sub-roots fall in one group) — and run impact ONCE per repo against the MERGED
+ * graph of the group. A multi-root repo's result goes to a graph-less repo folder
+ * `<out-dir>/<ns>/<repo>/<repo>/<base>.impact.json` (+ `<base>.impact/` shards), aligned with
+ * spring/nexcore; the sub-roots' own stale impact artifacts are pruned. A single-root repo
+ * keeps its impact next to its graph (the normal per-service variant).
  */
 function cmdImpactRepos(opts: Opts): void {
   const repoRoot = opts.flags['--repo-root'] ?? opts.flags['--repo'];
@@ -838,30 +874,35 @@ function cmdImpactRepos(opts: Opts): void {
   const incremental = '--incremental' in opts.flags;
   const since = opts.flags['--since'] || null;
 
-  // group graphs by resolved git work tree
-  const groups = new Map<string, { gitDir: string; prefix: string; graphs: string[] }>();
+  // group graphs by their (namespace, repo) — the nested layout `<out-dir>/<ns>/<repo>/<perRoot>/`
+  // (a monorepo's sub-roots share one <ns>/<repo>, so they fall in one group). The git work tree
+  // to MINE is still resolved per representative graph (its meta.root → nearest .git).
+  const groups = new Map<string, { ns: string; repo: string; gitDir: string; prefix: string; graphs: string[] }>();
   for (const gp of discoverServiceGraphs(outDir)) {
+    const rel = path.relative(outDir, gp).split(path.sep);   // [ns, repo, perRoot, <base>.json]
+    if (rel.length < 4) continue;                            // not in the nested layout — skip
+    const [ns, repo] = rel;
     const target = gitSource.resolveGitTarget(repoRootAbs, readGraphMetaRoot(gp));
     if (!target) {
       process.stderr.write(`  · ${path.basename(path.dirname(gp))}: skip (no git work tree at/above its checkout)\n`);
       continue;
     }
-    const grp = groups.get(target.gitDir) ?? { gitDir: target.gitDir, prefix: target.prefix, graphs: [] };
+    const key = `${ns}/${repo}`;
+    const grp = groups.get(key) ?? { ns, repo, gitDir: target.gitDir, prefix: target.prefix, graphs: [] };
     grp.graphs.push(gp);
-    groups.set(target.gitDir, grp);
+    groups.set(key, grp);
   }
 
   let analyzed = 0;
   for (const grp of groups.values()) {
     const sorted = grp.graphs.slice().sort();
     const repr = sorted[0];
-    // 표준 정렬(spring/nexcore 와 동일): repo 단위 impact 를 git work tree 이름의 폴더에 둔다 —
-    //   <out-dir>/<repoName>/<base>.impact.json (+ <base>.impact/ 샤드). 이 폴더엔 graph 가 없으므로
-    //   manifest 가 "graph 없는 repo 엔트리"(repo===name)로 잡고, 모듈(sub-root) 그래프들은 repo=R 로 묶인다.
-    //   단일 sub-root 면 repoName 이 그 root 폴더명과 같아 기존처럼 graph 와 한 폴더에 놓인다(single-graph 변형).
-    const repoName = path.basename(grp.gitDir);
+    // 표준 정렬(spring/nexcore 와 동일): 다중 sub-root repo 는 repo 단위 impact 를 graph-less
+    //   <out-dir>/<ns>/<repo>/<repo>/ 폴더에 둔다(manifest 가 "graph 없는 repo 엔트리"로 잡음).
+    //   단일 root 면 그 root 폴더(graph 옆)에 그대로 둔다(single-graph 변형).
+    const repoName = grp.repo;
     const base = path.basename(repr, '.json');
-    const repoDir = path.join(outDir, repoName);
+    const repoDir = sorted.length === 1 ? path.dirname(repr) : path.join(outDir, grp.ns, grp.repo, grp.repo);
     const out = path.join(repoDir, `${base}.impact.json`);
     // impact 가 repoDir 로 모이므로, 다른 sub-root 폴더의 (이전 실행) impact 산출물은 정리한다.
     for (const g of sorted) {

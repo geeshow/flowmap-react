@@ -16,7 +16,7 @@ BACKEND=../flowmap-spring/json/_combined.json,../flowmap-nexcore/json/_combined.
 # ───────────── 선택 (optional) ─────────────
 # PROJECT=fe-service-workspace   # 미지정 시 REPO(.repo) 아래 모든 프로젝트를 한 번에 분석
 # NAME=graph                     # 출력 파일명 베이스 (없으면 PROJECT, 그것도 없으면 graph)
-# OUT_DIR=json/frontend          # 결과 JSON 디렉터리 — <OUT_DIR>/<service>/<NAME>.{json,screens,join,impact}.json
+# OUT_DIR=json/projects          # 결과 JSON 디렉터리 — <OUT_DIR>/<git-ns>/<git-repo>/<per-root>/<NAME>.{json,screens,join,impact}.json
 # MODE=development               # Vue/Nuxt env 선택 (development|production). React 는 무시
 # PULL=true                      # 분석 전 git pull --ff-only (true/false). 로컬 샘플은 false
 # ENV_PROFILE=sandbox            # 모노레포 env-cmd(.env-cmdrc.json) 프로파일 — API 게이트웨이 host 해석
