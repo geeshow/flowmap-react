@@ -42,12 +42,41 @@ export interface ImpactResult {
 const SOURCE_EXT = /\.(tsx|ts|jsx|js|mjs|cjs|vue)$/i;
 
 /**
+ * Live, per-root progress line written to stderr DURING the heavy per-PR/per-file
+ * diff+parse. On a TTY it overwrites a single line in place (`\r`, no newline) so
+ * the slow analysis shows which file it is on right now; off a TTY (piped to a log)
+ * it falls back to one newline-terminated line per PR so the record is still legible.
+ */
+function makeProgress(label: string): (msg: string) => void {
+  const tag = label ? `[${label}] ` : '';
+  const tty = (process.stderr as unknown as { isTTY?: boolean }).isTTY;
+  if (!tty) {
+    return (msg) => process.stderr.write(`      ${tag}${msg}\n`);
+  }
+  const cols = (process.stderr as unknown as { columns?: number }).columns || 120;
+  return (msg) => {
+    const line = `      ${tag}${msg}`;
+    process.stderr.write('\r' + (line.length > cols ? line.slice(0, cols - 1) + '…' : line.padEnd(cols)));
+  };
+}
+
+/**
  * Analyze change impact for [pulls] against the current [graph]. [prefix] is the
  * repo-relative project dir (e.g. "front-official-desktop") prepended to git
  * paths so blob-derived ids match the graph's `<prefix>/...::Name` node ids.
+ * [label] tags the live progress line so each per-root run is identifiable.
  */
-export function analyze(repo: string, base: string, prefix: string, pulls: git.Pr[], graph: CallGraph): ImpactResult {
+export function analyze(
+  repo: string,
+  base: string,
+  prefix: string,
+  pulls: git.Pr[],
+  graph: CallGraph,
+  label = '',
+): ImpactResult {
   const webBase = git.webBaseUrl(repo);
+  const progress = makeProgress(label);
+  const tty = (process.stderr as unknown as { isTTY?: boolean }).isTTY;
   const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
   // callers adjacency: target id -> source ids (for the reverse walk to screens)
   const callers = new Map<string, string[]>();
@@ -62,7 +91,10 @@ export function analyze(repo: string, base: string, prefix: string, pulls: git.P
   const allChangedInGraph = new Set<string>();
   const allImpacted = new Set<string>();
 
+  const total = pulls.length;
+  let pi = 0;
   for (const pr of pulls) {
+    pi++;
     const sha = pr.mergeCommit;
     if (!sha) continue;
     const parent = git.firstParent(repo, sha);
@@ -70,7 +102,10 @@ export function analyze(repo: string, base: string, prefix: string, pulls: git.P
     const changedFns = new Map<string, FnRange>(); // id -> changed node's range (first-seen wins)
     const deletedIds = new Set<string>();
 
+    let ci = 0;
     for (const ch of changes) {
+      ci++;
+      progress(`PR ${pi}/${total} #${pr.number} · file ${ci}/${changes.length} ${ch.path}`);
       if (!SOURCE_EXT.test(ch.path)) continue; // non-source file: no node mapping
       const idPath = prefix ? `${prefix}/${ch.path}` : ch.path;
       const newFns =
@@ -136,6 +171,8 @@ export function analyze(repo: string, base: string, prefix: string, pulls: git.P
       deletedEndpoints: [],
     });
   }
+  // Clear the in-place progress line so the next stderr write starts clean.
+  if (tty && total) process.stderr.write('\r' + ' '.repeat((process.stderr as unknown as { columns?: number }).columns || 120) + '\r');
 
   // Spring-parity top-level shape (the flowmap UI sums these). The deleted/
   // breaking-endpoint counters are backend-semantic and always 0 for a frontend
