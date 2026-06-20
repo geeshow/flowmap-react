@@ -55,9 +55,11 @@ export interface IrComponent {
   line: number | null;
   jsxUsages: IrJsxUsage[]; // children rendered
   calls: IrCall[]; // resolved call sites
-  // For kind 'route-handler' (Next.js app/**/route.ts, pages/api): the served endpoint.
+  // For kind 'route-handler' (Next.js app/**/route.ts, pages/api; Express/Vite
+  // in-repo routers): the served endpoint.
   providerEndpoint?: string | null;
   providerMethod?: string | null;
+  providerSource?: 'next' | 'express'; // which detector found it (drives the node's marker)
 }
 
 export interface IrRoute {

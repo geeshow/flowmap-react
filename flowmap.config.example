@@ -20,6 +20,12 @@ BACKEND=../flowmap-spring/json/_combined.json,../flowmap-nexcore/json/_combined.
 # MODE=development               # Vue/Nuxt env 선택 (development|production). React 는 무시
 # PULL=true                      # 분석 전 git pull --ff-only (true/false). 로컬 샘플은 false
 # ENV_PROFILE=sandbox            # 모노레포 env-cmd(.env-cmdrc.json) 프로파일 — API 게이트웨이 host 해석
+# AFFINITY=flowmap.affinity.json # frontend svc ↔ backend project 힌트(JSON). 같은 REST path 를 여러 백엔드가
+#                                #   제공해 ambiguous(=false external)로 빠질 때, 그 프론트 서비스가 실제로 쓰는
+#                                #   백엔드 project 로 후보를 좁혀 matched 로 만든다. 형식:
+#                                #     { "services-account": ["account*","isa*"], "services-stock": ["supernova*"] }
+#                                #   키=프론트 서비스명 glob(graph meta.project), 값=백엔드 project glob 목록.
+#                                #   (`{ "affinity": { ... } }` 처럼 affinity 키 아래 중첩해도 됨)
 # --- 대용량 저장소 메모리 튜닝 ---
 # ENV=path/to/app.env            # 앱 env 파일(--env): KEY=VALUE 직접 주입(가장 확실한 host 주입 수단)
 # WORKERS=4                      # 동시 자식 프로세스 수

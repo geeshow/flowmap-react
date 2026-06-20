@@ -40,6 +40,7 @@ import { AnalysisContext } from './context';
 import { EnvResolver } from './envResolver';
 import { buildProjectProgram, discoverProjects, isNextProject, provenance, repoRel } from './program';
 import { NEXT_HANDLER_VERBS, findNextRoutes, findReactRouterRoutes, nextRouteHandlerPath, RouteDataFn } from './routeResolver';
+import { findServerRoutes } from './serverRoutes';
 import { normalize } from '../norm';
 import { StoreAccumulator, collectStores, emptyAccumulator } from './storeResolver';
 
@@ -87,6 +88,32 @@ export class TsResolver implements Resolver {
         const sym = ctx.symbolAt(declNameNode(m.decl) ?? m.decl);
         if (sym) compBySymbol.set(sym, m);
       }
+    }
+
+    // A2. In-repo server routes (Express/connect routers, Vite dev middleware) — provider
+    //     nodes whose id is the consumer's `ext:<M> <path>`, so graphBuilder merges them and
+    //     the call resolves internally (not a false external). Their handler bodies are walked
+    //     (added to `metas` before the walk) to capture handler → upstream-backend calls.
+    const seenRouteId = new Set(metas.map((m) => m.comp.id));
+    for (const r of findServerRoutes(pp.sourceFiles, pp.checker)) {
+      const id = `ext:${r.method ?? 'ANY'} ${r.endpoint}`;
+      if (seenRouteId.has(id)) continue;
+      seenRouteId.add(id);
+      const bodyOwner = r.handler ?? r.node;
+      const comp: IrComponent = {
+        id,
+        name: r.endpoint,
+        kind: 'route-handler',
+        exported: true,
+        isAsync: r.handler ? isAsyncFn(r.handler) : false,
+        line: lineOf(r.node.getSourceFile(), r.node),
+        jsxUsages: [],
+        calls: [],
+        providerEndpoint: r.endpoint,
+        providerMethod: r.method,
+        providerSource: 'express',
+      };
+      metas.push({ comp, decl: bodyOwner, bodyOwner, file: r.node.getSourceFile() });
     }
 
     // B. collect stores + bindings (project-wide)
@@ -178,6 +205,7 @@ export class TsResolver implements Resolver {
       c.kind = 'route-handler';
       c.providerEndpoint = ep;
       c.providerMethod = method;
+      c.providerSource = 'next';
       c.id = `ext:${method ?? 'ANY'} ${ep}`;
     }
   }

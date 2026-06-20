@@ -1,0 +1,8 @@
+{
+  "//": "fe-svc ↔ backend-project affinity hints. Copy to flowmap.affinity.json, set AFFINITY=flowmap.affinity.json in flowmap.config.",
+  "//key": "frontend service name (graph meta.project) — glob, '*' = wildcard.",
+  "//value": "backend project names that service talks to — glob list. Used to break a same-path ambiguous tie.",
+  "services-account": ["account*", "isa*"],
+  "services-collection": ["blackhole*"],
+  "services-stock": ["supernova*"]
+}

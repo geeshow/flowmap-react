@@ -100,7 +100,7 @@ export class GraphBuilder {
         layer: 'API',
         httpMethod: c.providerMethod ?? null,
         endpoint: c.providerEndpoint ?? null,
-        description: 'next-route-handler',
+        description: c.providerSource === 'express' ? 'express-route-handler' : 'next-route-handler',
         visibility: 'exported',
         isAsync: c.isAsync,
         file: f.path,

@@ -28,9 +28,17 @@ if [ ${#GRAPHS[@]} -eq 0 ]; then
   exit 1
 fi
 
-echo "[3] join → ${#GRAPHS[@]} graph(s) against $BACKEND" >&2
+# Optional fe-svc↔backend-project affinity hints (breaks same-path ambiguous ties).
+AFF_ARGS=()
+if [ -n "$AFFINITY" ] && [ -f "$AFFINITY" ]; then
+  AFF_ARGS=(--affinity "$AFFINITY")
+elif [ -n "$AFFINITY" ]; then
+  echo "[3] AFFINITY set but not found: $AFFINITY — joining without affinity hints" >&2
+fi
+
+echo "[3] join → ${#GRAPHS[@]} graph(s) against $BACKEND${AFFINITY:+ (affinity: $AFFINITY)}" >&2
 for g in "${GRAPHS[@]}"; do
   out="${g%.json}.join.json"
   echo "      $g → $out" >&2
-  "$FLOWMAP" join --graph "$g" --backend "$BACKEND" --out "$out"
+  "$FLOWMAP" join --graph "$g" --backend "$BACKEND" --out "$out" "${AFF_ARGS[@]}"
 done
