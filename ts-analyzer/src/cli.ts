@@ -604,7 +604,7 @@ function runImpact(
   repo: string,
   prefix: string,
   out: string | undefined,
-  o: { incremental: boolean; max: number; since: string | null; base: string | null },
+  o: { incremental: boolean; max: number; since: string | null; base: string | null; label?: string },
 ): boolean {
   const base = gitSource.resolveBranch(repo, o.base);
   if (!base) {
@@ -647,7 +647,7 @@ function runImpact(
     return true;
   }
 
-  const result = impact.analyze(repo, base, prefix, pulls, graph);
+  const result = impact.analyze(repo, base, prefix, pulls, graph, o.label ?? path.basename(repo));
   if (!out) {
     process.stdout.write(jsonOutput.writeValue(result.index) + '\n');
     return true;
@@ -837,7 +837,7 @@ function cmdImpactRepos(opts: Opts): void {
     const label = sorted.length > 1 ? `${repoName} (${sorted.length} sub-roots)` : path.basename(path.dirname(repr));
     process.stderr.write(`      ${label} → ${out}\n`);
     const merged = sorted.length === 1 ? readGraphFile(sorted[0]) : mergeGraphs(sorted.map(readGraphFile));
-    if (runImpact(merged, grp.gitDir, grp.prefix, out, { incremental, max, since, base: opts.flags['--base'] ?? null })) analyzed++;
+    if (runImpact(merged, grp.gitDir, grp.prefix, out, { incremental, max, since, base: opts.flags['--base'] ?? null, label })) analyzed++;
   }
   process.stderr.write(`impact-repos done: ${analyzed}/${groups.size} repo(s) analyzed\n`);
 }
