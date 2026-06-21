@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { parseGitLog, parseDiff, parseGhList, toWebBase, resolveGitTarget } from '../src/impact/git';
+import { parseGitLog, parseDiff, parseGhList, parseGhOpen, analyzedCommit, isOpenPr, toWebBase, resolveGitTarget } from '../src/impact/git';
 import { functions } from '../src/impact/fileParser';
 import { mergeIndex, ImpactResult } from '../src/impact/impact';
 
@@ -80,6 +80,34 @@ describe('parseGhList', () => {
   it('returns [] for non-array / malformed json', () => {
     expect(parseGhList('not json')).toEqual([]);
     expect(parseGhList('{}')).toEqual([]);
+  });
+});
+
+describe('parseGhOpen', () => {
+  it('maps headOid, status, updatedAt for open and draft PRs', () => {
+    const json = JSON.stringify([
+      { number: 42, title: 'wip', author: { login: 'alice' }, headRefOid: 'abc', createdAt: '2026-06-01T00:00:00Z', updatedAt: '2026-06-10T09:00:00Z', isDraft: false },
+      { number: 7, title: 'draft', author: { login: 'bob' }, headRefOid: 'def', createdAt: '2026-05-01T00:00:00Z', updatedAt: '2026-05-02T00:00:00Z', isDraft: true },
+    ]);
+    const prs = parseGhOpen(json);
+    expect(prs).toHaveLength(2);
+    expect(prs[0]).toMatchObject({ number: 42, status: 'open', headOid: 'abc', mergedAt: null, mergeCommit: null, updatedAt: '2026-06-10T09:00:00Z' });
+    expect(analyzedCommit(prs[0])).toBe('abc'); // no mergeCommit → head is analyzed revision
+    expect(isOpenPr(prs[0])).toBe(true);
+    expect(prs[1]).toMatchObject({ status: 'draft' });
+    expect(isOpenPr(prs[1])).toBe(true);
+  });
+  it('falls back to createdAt and tolerates garbage', () => {
+    const one = parseGhOpen(JSON.stringify([{ number: 1, title: 't', headRefOid: 'h', createdAt: '2026-01-01T00:00:00Z' }]));
+    expect(one[0].updatedAt).toBe('2026-01-01T00:00:00Z');
+    expect(one[0].status).toBe('open'); // isDraft absent → open
+    expect(parseGhOpen('not json')).toEqual([]);
+    expect(parseGhOpen('{}')).toEqual([]);
+  });
+  it('a merged PR is not open and uses its mergeCommit as the analyzed commit', () => {
+    const merged = parseGhList(JSON.stringify([{ number: 9, title: 'T', mergedAt: '2026-01-01', mergeCommit: { oid: 'sha9' } }]))[0];
+    expect(isOpenPr(merged)).toBe(false);
+    expect(analyzedCommit(merged)).toBe('sha9');
   });
 });
 

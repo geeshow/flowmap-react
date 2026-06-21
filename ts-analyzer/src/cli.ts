@@ -697,8 +697,11 @@ function runImpact(
   if (incremental && out && fs.existsSync(out)) {
     try {
       existingIndex = JSON.parse(fs.readFileSync(out, 'utf8'));
-      for (const p of ((existingIndex?.pulls as Array<{ number?: number; mergedAt?: string }>) ?? [])) {
-        if (Number.isFinite(p?.number)) analyzedNumbers.add(p.number as number);
+      for (const p of ((existingIndex?.pulls as Array<{ number?: number; mergedAt?: string; status?: string }>) ?? [])) {
+        // Open/draft rows are NOT "analyzed" — they change over time (and may later merge), so they
+        //   must be re-analyzed every run rather than skipped by the incremental filter.
+        const wasOpen = p?.status === 'open' || p?.status === 'draft';
+        if (Number.isFinite(p?.number) && !wasOpen) analyzedNumbers.add(p.number as number);
         if (p?.mergedAt && (!since || String(p.mergedAt) > since)) since = String(p.mergedAt);
       }
     } catch {
@@ -713,7 +716,13 @@ function runImpact(
     process.stderr.write(`impact: no PR source for base ${base} (no git PR markers + gh unavailable)\n`);
     return false;
   }
-  const pulls = incremental ? mined.filter((p) => !analyzedNumbers.has(p.number)) : mined;
+  const mergedSel = incremental ? mined.filter((p) => !analyzedNumbers.has(p.number)) : mined;
+  // Open (incl. draft) PRs targeting this base (gh-only; empty without a remote). Each head is
+  //   fetched so the impact walk can read its blobs offline. Always analyzed (never reused), so an
+  //   open PR's impact refreshes as it gains commits and when it eventually merges.
+  const openMined = gitSource.openPulls(repo, base, o.max);
+  for (const pr of openMined) if (pr.headOid) gitSource.fetchPullHead(repo, pr.number, pr.headOid);
+  const pulls = [...mergedSel, ...openMined];
 
   // Nothing new since the last run — leave the existing index + shards untouched.
   if (incremental && existingIndex && pulls.length === 0) {
