@@ -280,7 +280,14 @@ export function openPulls(repo: string, base: string | null, limit: number): Pr[
   const args = ['pr', 'list', '--state', 'open', '--limit', String(limit), '--json', 'number,title,author,headRefOid,createdAt,updatedAt,isDraft'];
   if (base) args.push('--base', base);
   const { out, code } = exec(repo, 'gh', args);
-  if (code !== 0) return [];
+  if (code !== 0) {
+    // gh 가 없거나 GHE 호스트 미인증이면 open PR 은 절대 못 가져옴(로컬 git 으론 불가능).
+    // silent 로 비우면 사용자가 인증 누락을 모르므로 한 줄 경고를 남긴다.
+    process.stderr.write(
+      `  open PRs skipped for ${path.basename(repo)} (gh exit ${code} — gh missing or not authenticated for the remote host?)\n`,
+    );
+    return [];
+  }
   return parseGhOpen(out);
 }
 
