@@ -22,6 +22,19 @@ export interface Pr {
   author: string | null;
   mergedAt: string | null;
   mergeCommit: string | null; // merge/squash commit oid; null if unavailable
+  status?: string; // merged | open | draft (absent = merged)
+  headOid?: string | null; // open PR head commit oid (analyzed revision); null/absent for merged
+  updatedAt?: string | null; // open PR last-updated (date for display/sort); null/absent for merged
+}
+
+/** The commit whose net diff is this PR's change set: merge/squash oid, or an open PR's head. */
+export function analyzedCommit(pr: Pr): string | null {
+  return pr.mergeCommit ?? pr.headOid ?? null;
+}
+
+/** True for an open (or draft) PR — analyzed against merge-base..head rather than first-parent. */
+export function isOpenPr(pr: Pr): boolean {
+  return pr.status === 'open' || pr.status === 'draft';
 }
 
 /** A changed file with the NEW-side line ranges touched (empty for pure deletions). */
@@ -258,6 +271,47 @@ export function parseGhList(json: string): Pr[] {
   return out;
 }
 
+/**
+ * Open (incl. draft) PRs targeting [base] via `gh pr list --state open`. gh-ONLY: an open PR has no
+ * commit on the base branch's first-parent history, so git-log can't surface it. Returns an empty
+ * list when `gh` can't run or there is no remote — i.e. simply "no open PRs".
+ */
+export function openPulls(repo: string, base: string | null, limit: number): Pr[] {
+  const args = ['pr', 'list', '--state', 'open', '--limit', String(limit), '--json', 'number,title,author,headRefOid,createdAt,updatedAt,isDraft'];
+  if (base) args.push('--base', base);
+  const { out, code } = exec(repo, 'gh', args);
+  if (code !== 0) return [];
+  return parseGhOpen(out);
+}
+
+/** Parse `gh pr list` open-state JSON (headRefOid/updatedAt/isDraft) into open PRs. Pure. */
+export function parseGhOpen(json: string): Pr[] {
+  let root: unknown;
+  try {
+    root = JSON.parse(json);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(root)) return [];
+  const out: Pr[] = [];
+  for (const n of root as Array<Record<string, any>>) {
+    const number = typeof n.number === 'number' ? n.number : NaN;
+    if (!Number.isFinite(number)) continue;
+    const updated = (n.updatedAt ? String(n.updatedAt) : null) ?? (n.createdAt ? String(n.createdAt) : null);
+    out.push({
+      number,
+      title: String(n.title ?? ''),
+      author: n.author?.login ? String(n.author.login) : null,
+      mergedAt: null, // open — not merged yet
+      mergeCommit: null,
+      status: n.isDraft ? 'draft' : 'open',
+      headOid: n.headRefOid ? String(n.headRefOid) : null,
+      updatedAt: updated,
+    });
+  }
+  return out;
+}
+
 // ---- per-commit diff / blob ----
 
 /** First parent of [sha] (the base side of a PR merge), or null if absent/root. */
@@ -265,9 +319,38 @@ export function firstParent(repo: string, sha: string): string | null {
   return git(repo, ['rev-parse', '--verify', '--quiet', `${sha}^1`]).out.trim() || null;
 }
 
+/**
+ * Best common ancestor of [a] and [b] — the base side of an OPEN PR's net change
+ * (`merge-base(<branch>, <head>)`), so the diff excludes commits already on the base branch.
+ * Null when either ref is unknown.
+ */
+export function mergeBase(repo: string, a: string, b: string): string | null {
+  return git(repo, ['merge-base', a, b]).out.trim() || null;
+}
+
+/** True when [sha] resolves to a commit present locally (e.g. after fetching a PR head). */
+export function hasCommit(repo: string, sha: string): boolean {
+  return git(repo, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]).out.trim().length > 0;
+}
+
+/**
+ * Fetch an open PR's head into the local object store (`git fetch origin pull/<n>/head`) so its
+ * blobs/diff are available offline to the impact walk. Best-effort: returns true only when the head
+ * commit is present afterwards (works on GitHub/GHE; no-op without a usable remote).
+ */
+export function fetchPullHead(repo: string, number: number, headOid: string): boolean {
+  git(repo, ['fetch', '--quiet', 'origin', `pull/${number}/head`]);
+  return hasCommit(repo, headOid);
+}
+
 /** Per-file new-side changed line ranges for [sha] vs its first parent. */
 export function changesIn(repo: string, sha: string): FileChange[] {
   return parseDiff(git(repo, ['show', sha, '--first-parent', '-U0', '-M', '--no-color', '--format=']).out);
+}
+
+/** New-side changed files + line ranges for `base..head` (rename-aware), like [changesIn]. */
+export function changesBetween(repo: string, base: string, head: string): FileChange[] {
+  return parseDiff(git(repo, ['diff', base, head, '-U0', '-M', '--no-color']).out);
 }
 
 /** Content of [path] at [sha], or null if absent. */

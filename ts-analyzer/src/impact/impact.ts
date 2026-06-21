@@ -95,10 +95,15 @@ export function analyze(
   let pi = 0;
   for (const pr of pulls) {
     pi++;
-    const sha = pr.mergeCommit;
+    // Analyzed revision: merged PR → merge/squash commit; open PR → its (fetched) head.
+    const sha = git.analyzedCommit(pr);
     if (!sha) continue;
-    const parent = git.firstParent(repo, sha);
-    const changes = git.changesIn(repo, sha);
+    // Base side of the net diff: open PR → merge-base(base branch, head) so commits already on the
+    //   base branch are excluded; merged PR → first parent. When an open PR head isn't available
+    //   locally (fetch failed / no remote) the diff is empty and the PR still appears in the list.
+    const open = git.isOpenPr(pr);
+    const parent = open ? git.mergeBase(repo, base, sha) : git.firstParent(repo, sha);
+    const changes = open ? git.changesBetween(repo, parent ?? base, sha) : git.changesIn(repo, sha);
     const changedFns = new Map<string, FnRange>(); // id -> changed node's range (first-seen wins)
     const deletedIds = new Set<string>();
 
@@ -153,6 +158,8 @@ export function analyze(
       title: pr.title,
       author: pr.author,
       mergedAt: pr.mergedAt,
+      updatedAt: pr.updatedAt ?? null,
+      status: pr.status ?? 'merged',
       mergeCommit: sha,
       changedNodeCount: changedFns.size,
       changedFileCount: changes.length,
@@ -163,6 +170,7 @@ export function analyze(
     // analysis is backend-only) so the flowmap UI's shard reader finds each field.
     shards.set(pr.number, {
       number: pr.number,
+      status: pr.status ?? 'merged',
       mergeCommit: sha,
       changedFiles: changes.map((c) => c.path),
       changedNodes,
