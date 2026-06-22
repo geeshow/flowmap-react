@@ -420,3 +420,143 @@ export function parseDiff(text: string): FileChange[] {
   flush();
   return out.filter((c) => c.path.length > 0);
 }
+
+// ---- per-PR file diffs (status + full patch) for <base>.pulls.json ----
+
+/**
+ * One changed file within a PR — richer than [FileChange]: GitHub's own status
+ * (added/removed/modified/renamed) plus the unified [patch] hunk and +/- line
+ * counts. [patch] is null for binary/too-large files; [previousPath] is set only
+ * for renames. Port of the Spring analyzer's GitHub.PrFile.
+ */
+export interface PrFile {
+  path: string;
+  status: string; // added | removed | modified | renamed
+  additions: number;
+  deletions: number;
+  changes: number;
+  previousPath: string | null;
+  patch: string | null;
+}
+
+/**
+ * Per-file status + unified patch for a PR — GIT-FIRST, gh-fallback (mirrors the
+ * Spring analyzer's GitHub.pullFiles). A merged PR uses its merge/squash commit's
+ * first-parent diff; an open PR uses merge-base([base], head)..head, so commits
+ * already on the base branch are excluded. Falls back to `gh api .../pulls/<n>/files`
+ * when git can't produce the diff (open head not fetched / git unavailable). Null
+ * only when neither source works.
+ */
+export function pullFiles(repo: string, pr: Pr, base: string): PrFile[] | null {
+  if (isOpenPr(pr)) {
+    const head = pr.headOid ?? null;
+    if (head && hasCommit(repo, head)) {
+      const from = mergeBase(repo, base, head) ?? base;
+      const { out, code } = git(repo, ['diff', from, head, '-M', '--no-color']);
+      if (code === 0) return parseShow(out);
+    }
+    return ghPullFiles(repo, pr.number);
+  }
+  const sha = pr.mergeCommit;
+  if (sha) {
+    const { out, code } = git(repo, ['show', '--first-parent', '-M', '--no-color', '--format=', sha]);
+    if (code === 0) return parseShow(out);
+  }
+  return ghPullFiles(repo, pr.number);
+}
+
+/** Parse a `git show`/`git diff -M` unified diff into per-file [PrFile]s (status, full patch, +/- counts). Pure. Port of Spring parseShow. */
+export function parseShow(diff: string): PrFile[] {
+  const files: PrFile[] = [];
+  let path: string | null = null;
+  let oldPath: string | null = null;
+  let status = 'modified';
+  let add = 0;
+  let del = 0;
+  let patch = '';
+  let inHunk = false;
+  const flush = () => {
+    if (!path) return;
+    files.push({
+      path,
+      status,
+      additions: add,
+      deletions: del,
+      changes: add + del,
+      previousPath: status === 'renamed' && oldPath && oldPath !== path ? oldPath : null,
+      patch: patch.length ? patch : null,
+    });
+  };
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      flush();
+      path = null;
+      oldPath = null;
+      status = 'modified';
+      add = 0;
+      del = 0;
+      patch = '';
+      inHunk = false;
+      const m = DIFF_GIT.exec(line);
+      if (m) {
+        oldPath = m[1];
+        path = m[2];
+      }
+      continue;
+    }
+    if (inHunk) {
+      patch += line + '\n';
+      const c = line.charAt(0);
+      if (c === '+') add++;
+      else if (c === '-') del++;
+      continue;
+    }
+    if (line.startsWith('new file')) status = 'added';
+    else if (line.startsWith('deleted file')) status = 'removed';
+    else if (line.startsWith('rename from ')) {
+      oldPath = line.slice('rename from '.length);
+      status = 'renamed';
+    } else if (line.startsWith('rename to ')) path = line.slice('rename to '.length);
+    else if (line.startsWith('--- a/')) oldPath = line.slice('--- a/'.length);
+    else if (line.startsWith('+++ b/')) path = line.slice('+++ b/'.length);
+    else if (line.startsWith('@@')) {
+      inHunk = true;
+      patch += line + '\n';
+    }
+  }
+  flush();
+  return files.filter((f) => f.path.length > 0);
+}
+
+/** File-level changes via `gh api repos/{owner}/{repo}/pulls/{n}/files` (fallback). Null when gh can't run. */
+export function ghPullFiles(repo: string, number: number): PrFile[] | null {
+  const { out, code } = exec(repo, 'gh', ['api', '--paginate', `repos/{owner}/{repo}/pulls/${number}/files`]);
+  if (code !== 0) return null;
+  return parseFiles(out);
+}
+
+/** Parse a REST `pulls/{n}/files` JSON array into [PrFile]s. Pure. */
+export function parseFiles(json: string): PrFile[] {
+  let root: unknown;
+  try {
+    root = JSON.parse(json);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(root)) return [];
+  const out: PrFile[] = [];
+  for (const n of root as Array<Record<string, any>>) {
+    const p = n.filename ? String(n.filename).trim() : '';
+    if (!p) continue;
+    out.push({
+      path: p,
+      status: n.status ? String(n.status) : 'modified',
+      additions: typeof n.additions === 'number' ? n.additions : 0,
+      deletions: typeof n.deletions === 'number' ? n.deletions : 0,
+      changes: typeof n.changes === 'number' ? n.changes : 0,
+      previousPath: n.previous_filename ? String(n.previous_filename).trim() : null,
+      patch: n.patch ? String(n.patch) : null,
+    });
+  }
+  return out;
+}

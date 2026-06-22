@@ -30,7 +30,7 @@ function int(obj: any, field: string): number | null {
 const EDGE_KINDS: EdgeKind[] = ['internal', 'external', 's2s', 'batch', 'resource'];
 
 // Sibling suffixes that mark a derived artifact rather than a pure `<project>.json` graph.
-const MANIFEST_SUFFIXES = ['.join.json', '.screens.json', '.openapi.json', '.impact.json'];
+const MANIFEST_SUFFIXES = ['.join.json', '.screens.json', '.openapi.json', '.impact.json', '.pulls.json'];
 
 /**
  * Scan `outDir` and (re)write `_manifest.json` — a lightweight catalogue of the
@@ -110,6 +110,7 @@ export function writeManifest(outDir: string): string {
         graph: `${rel}/${graphFile}`,
         openapi: sibling('openapi.json'),
         impact: sibling('impact.json'),
+        pulls: sibling('pulls.json'),
         join: sibling('join.json'),
         screens: sibling('screens.json'),
         nodes,
@@ -134,6 +135,9 @@ export function writeManifest(outDir: string): string {
         return null;
       }
       if (!impactFile) return null;
+      // The `<base>.pulls.json` sibling (same base as the impact), if it was written.
+      const pullsBase = impactFile.slice(0, -'.impact.json'.length);
+      const pullsFile = fs.existsSync(path.join(svcDir, `${pullsBase}.pulls.json`)) ? `${rel}/${pullsBase}.pulls.json` : null;
       const seg = segOf(svcDir);
       return {
         name: service,
@@ -143,6 +147,7 @@ export function writeManifest(outDir: string): string {
         graph: null,
         openapi: null,
         impact: `${rel}/${impactFile}`,
+        pulls: pullsFile,
         join: null,
         screens: null,
         nodes: 0,
