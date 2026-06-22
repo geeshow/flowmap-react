@@ -49,7 +49,8 @@ Vuex 액션을 그래프 노드로 만들어 `페이지 → 액션 → 엔드포
 |---|:--:|---|
 | `REPO` | ✅ | 분석 대상 소스 체크아웃 루트(`.repo/<project>/` 관례) |
 | `BACKEND` | ✅ | join 입력 백엔드 결합 그래프(`_combined.json`, CSV 다중 가능) |
-| `OUT_DIR` · `NAME` | | 출력 디렉터리/파일명 베이스 — `<OUT_DIR>/<service>/<NAME>.*.json` |
+| `OUT_DIR` · `NAME` | | 출력 디렉터리/파일명 베이스 — `<OUT_DIR>/<namespace>/<repo>/<per-root>/<NAME>.*.json` (실제 git ns/repo 로 중첩) |
+| `AFFINITY` | | join 모호성(같은 경로) 해소용 fe-svc→backend-project 힌트 파일(`flowmap.affinity.json`) |
 | `PROJECT` · `MODE` · `PULL` | | 단일 프로젝트 한정 / Vue env / 분석 전 git pull |
 | `ENV_PROFILE` · `ENV` · `WORKERS` … | | 모노레포 env 프로파일 / 메모리 튜닝 |
 
@@ -80,7 +81,15 @@ node dist/cli.js screens --repo ../.repo --project sample-shop-react --out ../js
 # 통계 / 서브그래프 탐색
 node dist/cli.js stats  --graph ../json/frontend/sample-shop-react/graph.json
 node dist/cli.js search --graph ../json/frontend/sample-shop-react/graph.json --method UserPage --direction callees --depth 2
+
+# 4) 변경영향도(impact): 머지 PR → 변경 노드 → 도달 화면(SCREEN). git-first, gh 폴백
+node dist/cli.js impact --repo-root ../.repo --graph ../json/frontend/sample-shop-react/graph.json --out ../json/frontend/sample-shop-react/graph.impact.json
+node dist/cli.js impact-repos --repo-root ../.repo --out-dir ../json   # repo(work-tree)별로 impact 1회씩 일괄
+node dist/cli.js doctor --graph ../json/frontend/sample-shop-react/graph.json   # 그래프 헬스(고아·dangling·연결성)
 ```
+
+> 전체 명령: `pipeline`(=`all`) · `analyze` · `join` · `screens` · `search` · `stats` · `doctor` ·
+> `impact` · `impact-repos`. 각 명령의 옵션은 인자 없이 `./flowmap` 을 실행하면 usage 로 출력됩니다.
 
 분석 대상은 백엔드와 같은 관례로 `.repo/<project>/` 아래에 둡니다. 각 프로젝트의 `package.json`으로
 React/Vue를 자동 판별해 알맞은 리졸버를 적용합니다. Vue/Nuxt는 `--mode development|production`으로
@@ -109,9 +118,10 @@ cp flowmap.config.example flowmap.config   # 값을 환경에 맞게 수정
 ```
 
 설정파일(`flowmap.config`)은 `KEY=VALUE` 형식이며 `${VAR}` 치환을 지원합니다. 출력은
-**서비스(프로젝트 루트)별 디렉터리**로 나뉩니다 — `<OUT_DIR>/<service>/<NAME>.json`,
-`.screens.json`, `.join.json`, `.impact.json` (+ `<NAME>.impact/<n>.json` 샤드). 전체 카탈로그
-`_manifest.json` 은 `<OUT_DIR>` 최상위 1개로, 각 항목 경로를 `<service>/<file>` 로 가리킵니다.
+**실제 git namespace/repo 를 따라 중첩된 디렉터리**로 나뉩니다 —
+`<OUT_DIR>/<namespace>/<repo>/<per-root>/<NAME>.json`, `.screens.json`, `.join.json`,
+`.impact.json` (+ `<NAME>.impact/<n>.json` 샤드). 전체 카탈로그 `_manifest.json` 은 `<OUT_DIR>`
+최상위 1개로, 각 항목 경로를 `<namespace>/<repo>/<per-root>/<file>` 로 가리킵니다.
 
 | 키 | 설명 |
 |---|---|
@@ -160,7 +170,9 @@ flowmap-react/
 ├── .repo/
 │   ├── sample-shop-react/    # React 데모 픽스처 (백엔드 sample-shop과 엔드포인트 공유)
 │   └── sample-shop-nuxt/     # Vue2/Nuxt2 데모 픽스처 (동일 엔드포인트)
-├── json/                     # 분석 산출물 (gitignore)
+├── json/                     # 분석 산출물 (gitignore) — projects/<ns>/<repo>/<root>/
+├── scripts/                  # 빌드/파이프라인 셸 스크립트 (build.sh, pipeline/01-refresh…05-impact)
+├── flowmap                   # 레포 루트 실행 래퍼 (ts-analyzer 빌드 후 dist/cli.js 호출)
 ├── docs/
 │   └── MANUAL.md             # 상세 매뉴얼 (명령어·스키마·내부 동작·한계)
 └── README.md                 # 이 파일
@@ -181,7 +193,7 @@ flowmap-react/
 ## 검증
 
 ```bash
-cd ts-analyzer && npm test     # 157 tests
+cd ts-analyzer && npm test     # 179 tests
 ```
 
 - `norm.spec` — 조인 키 정규화의 백엔드 바이트 동일성(골든 테이블)
