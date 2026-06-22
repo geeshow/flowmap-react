@@ -13,6 +13,9 @@ esac
 for target in "${PROJECT:+$REPO/$PROJECT}" "$REPO"; do
   [ -n "$target" ] || continue
   if [ -d "$target" ] && git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # Analysis is always master-based: switch to master before pull (no-op if already on
+    # master; keeps current branch if master is absent/checkout fails).
+    git -C "$target" checkout master >/dev/null 2>&1 || echo "[0] checkout master failed — keeping current branch" >&2
     echo "[0] pull: git -C $target pull --ff-only" >&2
     git -C "$target" pull --ff-only || echo "[0] pull failed — continuing with current checkout" >&2
     exit 0
