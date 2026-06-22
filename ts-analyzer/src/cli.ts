@@ -25,6 +25,7 @@ import { buildScreens } from './screens';
 import { ensureHeap, planWorkers, runProjectWorkersByRoot } from './workers';
 import * as impact from './impact/impact';
 import * as gitSource from './impact/git';
+import * as putPulls from './impact/pulls';
 
 interface Opts {
   flags: Record<string, string>;
@@ -678,7 +679,15 @@ function runImpact(
   repo: string,
   prefix: string,
   out: string | undefined,
-  o: { incremental: boolean; max: number; since: string | null; base: string | null; label?: string },
+  o: {
+    incremental: boolean;
+    max: number;
+    since: string | null;
+    base: string | null;
+    label?: string;
+    noPullFiles?: boolean;
+    refetchPullFiles?: boolean;
+  },
 ): boolean {
   const base = gitSource.resolveBranch(repo, o.base);
   if (!base) {
@@ -769,6 +778,24 @@ function runImpact(
   // Impact output is a sibling of the graph inside the service dir; the catalogue
   // sits one level up at OUT_DIR (refreshManifest takes dirname of its arg).
   refreshManifest(path.dirname(out));
+
+  // Per-PR file diffs → `<base>.pulls.json` index + `<base>.pulls/<n>.json` shards (the
+  // sibling other analyzers emit; the sync's manifest links it via each entry's `pulls`).
+  // Best-effort: a failure here does NOT fail impact, which already succeeded.
+  if (!o.noPullFiles) {
+    try {
+      const fileBase = impact.baseNameOf(out);
+      const { fetched, reused } = putPulls.writePulls(path.dirname(out), fileBase, repo, base, pulls, {
+        incremental,
+        refetch: o.refetchPullFiles,
+      });
+      process.stderr.write(
+        `wrote ${path.join(path.dirname(out), `${fileBase}.pulls.json`)}: ${fetched + reused} PRs (${fetched} fetched, ${reused} reused)\n`,
+      );
+    } catch (e) {
+      process.stderr.write(`pull-files: ${(e as Error).message} (impact kept)\n`);
+    }
+  }
   return true;
 }
 
@@ -821,13 +848,15 @@ function cmdImpact(opts: Opts): void {
     max: parseInt(opts.flags['--max'] ?? '10', 10) || 10,
     since: opts.flags['--since'] || null,
     base: opts.flags['--base'] ?? null,
+    noPullFiles: '--no-pull-files' in opts.flags,
+    refetchPullFiles: '--refetch-pull-files' in opts.flags,
   });
   if (!ok) process.exit(1);
 }
 
 /** Per-service graph files under the nested output root (`<out-dir>/<ns>/<repo>/<perRoot>/<base>.json`). */
 function discoverServiceGraphs(outDir: string): string[] {
-  const derived = /\.(join|screens|openapi|impact)\.json$/;
+  const derived = /\.(join|screens|openapi|impact|pulls)\.json$/;
   const graphs: string[] = [];
   function rec(d: string): void {
     let entries: fs.Dirent[];
@@ -882,6 +911,8 @@ function cmdImpactRepos(opts: Opts): void {
   const max = parseInt(opts.flags['--max'] ?? '10', 10) || 10;
   const incremental = '--incremental' in opts.flags;
   const since = opts.flags['--since'] || null;
+  const noPullFiles = '--no-pull-files' in opts.flags;
+  const refetchPullFiles = '--refetch-pull-files' in opts.flags;
 
   // group graphs by their (namespace, repo) — the nested layout `<out-dir>/<ns>/<repo>/<perRoot>/`
   // (a monorepo's sub-roots share one <ns>/<repo>, so they fall in one group). The git work tree
@@ -925,7 +956,7 @@ function cmdImpactRepos(opts: Opts): void {
     const label = sorted.length > 1 ? `${repoName} (${sorted.length} sub-roots)` : path.basename(path.dirname(repr));
     process.stderr.write(`      ${label} → ${out}\n`);
     const merged = sorted.length === 1 ? readGraphFile(sorted[0]) : mergeGraphs(sorted.map(readGraphFile));
-    if (runImpact(merged, grp.gitDir, grp.prefix, out, { incremental, max, since, base: opts.flags['--base'] ?? null, label })) analyzed++;
+    if (runImpact(merged, grp.gitDir, grp.prefix, out, { incremental, max, since, base: opts.flags['--base'] ?? null, label, noPullFiles, refetchPullFiles })) analyzed++;
   }
   process.stderr.write(`impact-repos done: ${analyzed}/${groups.size} repo(s) analyzed\n`);
 }
@@ -953,11 +984,12 @@ function usage(): void {
       '  stats   [--graph g.json | --repo <dir>]',
       '  doctor  [--graph g.json | --repo <dir>] [--max-orphans N]   # graph health: orphans, dangling, connectivity',
       '  screens --repo <dir> [--project P] [--out f.json]   # screen layout/wireframe data',
-      '  impact  (--git <repo> | --repo-root <.repo>) --graph g.json [--out f.impact.json] [--base branch] [--max N] [--prefix P] [--incremental] [--since DATE]',
+      '  impact  (--git <repo> | --repo-root <.repo>) --graph g.json [--out f.impact.json] [--base branch] [--max N] [--prefix P] [--incremental] [--since DATE] [--no-pull-files] [--refetch-pull-files]',
       '          # --repo-root: auto-find the git work tree from the graph meta.root (walks up; monorepo packages mine the monorepo git)',
       '          # --incremental: reuse PRs already in --out, analyze only those merged since the last run (or --since DATE)',
       '          # --graph a.json,b.json: merge several sub-root graphs (one monorepo) and analyze their shared git once',
-      '  impact-repos --repo-root <.repo> --out-dir <service-dir root> [--max N] [--incremental] [--since DATE]',
+      '          # also writes <base>.pulls.json index + <base>.pulls/<n>.json shards (per-PR file diffs); --no-pull-files skips, --refetch-pull-files re-fetches',
+      '  impact-repos --repo-root <.repo> --out-dir <service-dir root> [--max N] [--incremental] [--since DATE] [--no-pull-files] [--refetch-pull-files]',
       '          # group every service graph by git work tree and analyze impact ONCE per repo (monorepo sub-roots share one impact)',
       '          # per-PR change impact: changed nodes + the screens they reach (git-first, gh fallback)',
       '',
